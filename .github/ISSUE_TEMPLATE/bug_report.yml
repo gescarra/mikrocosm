@@ -1,0 +1,36 @@
+name: Bug report
+description: Something renders wrong, validation misbehaves or a playbook fails.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste `keys.json` or a rendered `.rsc` file. Both contain private keys.**
+        Swap your own ASN, prefixes and addresses for documentation ranges before posting.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: topology
+    attributes:
+      label: Relevant topology.yml excerpt
+      render: yaml
+  - type: textarea
+    id: output
+    attributes:
+      label: Command output
+      render: text
+  - type: input
+    id: routeros
+    attributes:
+      label: RouterOS version
+      placeholder: "7.25"
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12"

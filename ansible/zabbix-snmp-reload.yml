@@ -1,0 +1,80 @@
+# =====================================================================
+#  zabbix-snmp-reload.yml. Flush Zabbix's SNMPv3 engine cache after a
+#  RouterOS package install.
+#
+#  WHY: SNMPv3 (RFC 3414) requires an agent's engineBoots to persist and
+#  only ever increase. RouterOS breaks that on a package install: measured
+#  going 7.24.5 -> 7.25.1, every router came back with engineBoots=1 where
+#  Zabbix had cached 3 and 4. Zabbix only accepts a time-window correction
+#  that moves engineBoots FORWARD, so it discarded every reply as
+#  notInTimeWindow and reported "Timeout while connecting" on all hosts at
+#  once: ICMP clean, firewall counters clean, routers answering on the
+#  wire. Plain reboots did increment the counter; only the upgrade reset it.
+#
+#  `zabbix_server -R snmp_cache_reload` drops the cached engineID / boots /
+#  time for every host, so the next poll re-discovers from scratch. No
+#  server restart, no lost queue, seconds to run. (Zabbix 7.0+ also does
+#  this on its own every 24h. This just makes it minutes, not a day.)
+#
+#  Imported at the end of upgrade.yml and upgrade-npk.yml, where it runs
+#  only if at least one router actually rebooted onto a new package. Run it
+#  standalone after an aborted upgrade, or after any manual one:
+#
+#    ansible-playbook zabbix-snmp-reload.yml
+#
+#  A failure here is a WARNING, never a failed run: by the time it executes
+#  the routers are already upgraded and verified, and the fix is one command
+#  you can run by hand (printed in the warning).
+# =====================================================================
+- name: Flush Zabbix's SNMPv3 engine cache
+  # `routers` + run_once, not `localhost`: --limit br1.ord1 (documented usage
+  # of both upgrade playbooks) filters localhost out of the run, and the play
+  # would silently match nothing. Every task runs on the control node anyway
+  # (connection: local); this only picks which host's vars it runs under.
+  hosts: routers
+  gather_facts: false
+  connection: local
+  run_once: true
+
+  vars:
+    # Standalone: always reload. Imported by an upgrade playbook (which
+    # passes only_if_installed=true): reload only if some router in this
+    # run set npk_installed, i.e. actually rebooted onto a new package.
+    only_if_installed: false
+    reload_needed: >-
+      {{ not (only_if_installed | bool)
+         or (groups['routers'] | default([])
+             | map('extract', hostvars) | selectattr('npk_installed', 'defined')
+             | selectattr('npk_installed') | list | length > 0) }}
+
+    zabbix_ssh: "{{ ['ssh'] + zabbix_ssh_opts + [zabbix_ssh_target] }}"
+    zabbix_cmd: "docker exec {{ zabbix_container }} zabbix_server -R snmp_cache_reload"
+
+  tasks:
+    - name: "Zabbix | nothing rebooted onto a new package — cache left alone"
+      ansible.builtin.meta: end_play
+      when: not (zabbix_snmp_reload | bool) or not (reload_needed | bool)
+
+    - name: "Zabbix | --check: report only"
+      ansible.builtin.debug:
+        msg: "Would run on {{ zabbix_ssh_target }}: {{ zabbix_cmd }}"
+      when: ansible_check_mode
+
+    - name: "Zabbix | snmp_cache_reload"
+      ansible.builtin.command:
+        argv: "{{ zabbix_ssh + [zabbix_cmd] }}"
+      register: zbx_reload
+      changed_when: zbx_reload.rc == 0
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: "Zabbix | result"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('Zabbix SNMP cache flushed on ' ~ zabbix_ssh_target ~ ': ' ~ (zbx_reload.stdout | trim))
+             if zbx_reload.rc == 0 else
+             ('WARNING: snmp_cache_reload FAILED (rc=' ~ zbx_reload.rc ~ '): '
+              ~ (zbx_reload.stderr | default('') | trim)
+              ~ '. SNMPv3 polling stays down until it runs. By hand: ssh '
+              ~ zabbix_ssh_target ~ ' ' ~ zabbix_cmd) }}
+      when: not ansible_check_mode

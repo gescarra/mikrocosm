@@ -1,0 +1,400 @@
+# =====================================================================
+#  chaos.yml. Prove the failover, don't assume it.
+#
+#  docs/failure-modes.md describes what happens when an upstream dies, when a
+#  WAN dies, when a firewall dies. Every one of those is a claim about
+#  behaviour, and the functional suite asserts STATE. Sessions established,
+#  adjacencies Full, routes present. State isn't behaviour: a network can sit
+#  in a perfectly healthy state and still fail to converge when you take
+#  something away.
+#
+#  ANSIBLE ORCHESTRATES, PYTEST ASSERTS. That split runs through the whole
+#  repo: playbooks CHANGE things (upload, reset, disable, restore) because
+#  ordering, retries and rollback are what Ansible is good at; the checks are
+#  `pytest tests/functional`, because assertions want structured data, real
+#  fixtures and a JUnit report. This playbook breaks something and then calls
+#  the same end-to-end test the deployment gate uses.
+#
+#  So this breaks a live path on purpose, asserts the end-to-end test STILL
+#  passes, and puts it back.
+#
+#    ansible-playbook chaos.yml                        # every scenario
+#    ansible-playbook chaos.yml -e scenario=upstream   # just one
+#    ansible-playbook chaos.yml -e scenario=wan
+#    ansible-playbook chaos.yml -e scenario=customer
+#
+#  MANUAL, NEVER AUTOMATIC. It's deliberately not part of the merge pipeline:
+#  the right time to run this is when you're watching it, not while you're
+#  reviewing somebody else's commit.
+#  Chaos engineering at home: the universe is going to do this anyway, just
+#  at a worse time and without a deadman.
+#
+#  ---------------------------------------------------------------------
+#  THE DEADMAN
+#
+#  Every scenario schedules its own undo ON THE ROUTER before it breaks
+#  anything, and cancels it after restoring. If this playbook is killed, the
+#  runner loses power, or the network partition takes out the control node
+#  along with the path being tested, the router repairs itself in
+#  `deadman_minutes` without anyone present.
+#
+#  An `always:` block isn't enough for this. `always:` runs when a TASK fails;
+#  it doesn't run when the PROCESS dies, and a chaos test whose whole purpose
+#  is to sever a network path is unusually likely to sever the path the restore
+#  would have travelled over.
+# =====================================================================
+
+- name: Chaos — failover, proved
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  any_errors_fatal: true
+
+  vars:
+    scenario: all
+    deadman_minutes: 10
+    converge_wait: 45          # seconds to let the network re-decide
+
+    manifest: "{{ lookup('ansible.builtin.file', manifest_path) | from_json }}"
+    e2e: "{{ manifest.e2e }}"
+
+    # The SAME end-to-end assertion the pipeline gates on, re-run mid-failover.
+    # Calling the real test rather than re-implementing a lighter version of it
+    # is the whole point: a failover test that checks something weaker than the
+    # real test proves something weaker than the real test.
+    egress_check:
+      - pytest
+      - "{{ playbook_dir }}/../tests/functional/test_e2e.py"
+      - -q
+      - -k
+      - internet_sees_us
+
+    # ---- the deadman, written ONCE ---------------------------------
+    #
+    # Each scenario supplies `undo`, the RouterOS command that puts its own
+    # breakage back. A scheduler on the router runs it if this playbook never
+    # gets to: see THE DEADMAN at the top of the file.
+    #
+    # NOTHING BELOW IS ESCAPED, and that's the entire design. The undo goes
+    # into a `source={...}` block, where RouterOS treats quotes as ordinary
+    # script text, and the scheduler names the script instead of quoting it.
+    #
+    # It got here by way of two bugs in the same three characters. First the
+    # undo was interpolated into `on-event="..."` unescaped, so the `"` before
+    # `ebgp` closed the argument 47 characters early:
+    #
+    #   expected end of command (line 1 column 114)
+    #
+    # Then it was escaped as `replace('"', '\\"')`, which is correct in plain
+    # Jinja2 and WRONG in Ansible. Ansible doesn't process backslash escapes
+    # in Jinja string literals, so that renders `\\"` and the router says:
+    #
+    #   expected end of command (line 1 column 116)
+    #
+    # Two characters apart, three hours apart, same command. The lesson isn't
+    # "count the backslashes more carefully". It's that a string crossing
+    # YAML, Jinja, Ansible, ssh and RouterOS has five layers that each want a
+    # say, and the only robust move is to give none of them anything to escape.
+    #
+    # The leading removes matter too. `add` refuses a duplicate name, so an
+    # armed deadman left behind by a crashed run (the exact situation the
+    # deadman exists for) made the NEXT run unable to arm.
+    deadman_arm: >-
+      /system/script remove [find name=chaos-undo];
+      /system/scheduler remove [find name=chaos-deadman];
+      /system/script add name=chaos-undo policy=read,write,test
+      source={{ '{' ~ undo ~ '}' }};
+      /system/scheduler add name=chaos-deadman
+      interval={{ deadman_minutes }}m on-event=chaos-undo
+      policy=read,write,test comment="chaos.yml insurance"
+    deadman_disarm: >-
+      /system/scheduler remove [find name=chaos-deadman];
+      /system/script remove [find name=chaos-undo]
+
+    routers: "{{ manifest.routers }}"
+    # Same switch the inventory honours, applied to manifest lookups. Without
+    # it chaos would drive a border router at its public address while every
+    # other playbook used the loopback. And from inside the AS that path does
+    # not work at all. See ansible_host() in emit.py.
+    addr_key: "{{ 'bootstrap_host' if use_bootstrap | bool else 'ansible_host' }}"
+    first_br: "{{ manifest.deploy_order | select('in', manifest.routers)
+                  | map('extract', manifest.routers)
+                  | selectattr('role', 'equalto', 'br') | map(attribute='fqdn')
+                  | first }}"
+    first_er: "{{ manifest.deploy_order | select('in', manifest.routers)
+                  | map('extract', manifest.routers)
+                  | selectattr('role', 'equalto', 'er') | map(attribute='fqdn')
+                  | first }}"
+
+  tasks:
+    - name: "chaos | plan"
+      ansible.builtin.debug:
+        msg: >-
+          Scenario '{{ scenario }}'. Target border router {{ first_br }},
+          target edge router {{ first_er }}. Every change is undone by this
+          playbook, and independently by a {{ deadman_minutes }}-minute
+          scheduler on the router itself.
+
+    # ---- confirm the network is healthy BEFORE breaking it ------------
+    # Otherwise a scenario that "fails" may simply have started broken, and the
+    # chaos test gets blamed for a fault it merely revealed at a bad moment.
+    - name: "chaos | baseline the end-to-end path first"
+      ansible.builtin.command:
+        argv: "{{ egress_check }}"
+      changed_when: false
+
+    # =================================================================
+    #  1. An upstream dies.
+    #
+    #  Kill one border router's eBGP session to its transit provider. The
+    #  network must keep working through the other border router: the ERs learn
+    #  a default from both, the /24 is still originated by the survivor, and
+    #  return traffic still arrives.
+    # =================================================================
+    - name: "chaos | upstream"
+      when: scenario in ['all', 'upstream']
+      vars:
+        target: "{{ first_br }}"
+        ssh_base: "{{ ['ssh', '-p', ssh_port | string] + ros_ssh_opts
+                      + [router_user ~ '@' ~ routers[first_br][addr_key]] }}"
+        undo: "/routing/bgp/connection enable [find where name~\"ebgp\"]"
+      block:
+        - name: "chaos/upstream | arm the deadman on {{ target }}"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + [deadman_arm] }}"
+          changed_when: true
+
+        - name: "chaos/upstream | DISABLE the upstream session on {{ target }}"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + ['/routing/bgp/connection disable [find where name~\"ebgp\"]'] }}"
+          changed_when: true
+
+        - name: "chaos/upstream | let the network re-decide"
+          ansible.builtin.pause:
+            seconds: "{{ converge_wait }}"
+
+        - name: "chaos/upstream | the internet still reaches us"
+          ansible.builtin.command:
+            argv: "{{ egress_check }}"
+          changed_when: false
+          register: egress
+          retries: 5
+          delay: 15
+          until: egress.rc == 0
+
+        - name: "chaos/upstream | PASS"
+          ansible.builtin.debug:
+            msg: >-
+              With {{ target }}'s upstream down, the end-to-end path still
+              works and still sources from inside {{ e2e.egress_must_be_in }}.
+              The surviving border router carries the prefix on its own.
+
+      always:
+        - name: "chaos/upstream | RESTORE the upstream session"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + [undo] }}"
+          changed_when: true
+
+        - name: "chaos/upstream | disarm the deadman"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + [deadman_disarm] }}"
+          changed_when: true
+          failed_when: false
+
+        - name: "chaos/upstream | wait for the session to come back"
+          ansible.builtin.pause:
+            seconds: "{{ converge_wait }}"
+
+    # =================================================================
+    #  2. A WAN dies.
+    #
+    #  Disable one edge router's wan1 tunnels. OSPF (the only thing on this
+    #  network that notices a dead WireGuard link) must move the traffic to
+    #  wan2, which carries a deliberately higher cost precisely so it's the
+    #  loser until it's the only option.
+    #
+    #  Safe to drive from here: the ER is reached on its TRANSIT address
+    #  (ether4), not through any tunnel, so disabling every tunnel on it does
+    #  not disconnect the control node from it. That property is the whole
+    #  reason the inventory uses transit addresses (AD-LOG 25).
+    # =================================================================
+    - name: "chaos | wan"
+      when: scenario in ['all', 'wan']
+      vars:
+        target: "{{ first_er }}"
+        ssh_base: "{{ ['ssh', '-p', ssh_port | string] + ros_ssh_opts
+                      + [router_user ~ '@' ~ routers[first_er][addr_key]] }}"
+        wan1_ifaces: "{{ routers[first_er].tunnels
+                         | selectattr('link_class', 'equalto', 'wan1')
+                         | map(attribute='iface') | list }}"
+        undo: "/interface/wireguard enable [find]"
+      block:
+        - name: "chaos/wan | arm the deadman on {{ target }}"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + [deadman_arm] }}"
+          changed_when: true
+
+        - name: "chaos/wan | DISABLE the wan1 tunnels on {{ target }}"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + ['/interface/wireguard disable [find name=' ~ item ~ ']'] }}"
+          changed_when: true
+          loop: "{{ wan1_ifaces }}"
+
+        - name: "chaos/wan | let OSPF notice and reconverge"
+          ansible.builtin.pause:
+            seconds: "{{ converge_wait }}"
+
+        - name: "chaos/wan | the path survived on wan2"
+          ansible.builtin.command:
+            argv: "{{ egress_check }}"
+          changed_when: false
+          register: egress
+          retries: 5
+          delay: 15
+          until: egress.rc == 0
+
+        - name: "chaos/wan | {{ target }} still reaches every loopback"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + ['/ping ' ~ item.value ~ ' src-address=' ~ routers[first_er].loopback ~ ' count=3'] }}"
+          register: wan_ping
+          changed_when: false
+          failed_when: wan_ping.stdout is not search('received=[1-9]')
+          loop: "{{ manifest.loopbacks | dict2items }}"
+          when: item.key != first_er
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: "chaos/wan | PASS"
+          ansible.builtin.debug:
+            msg: >-
+              With wan1 down on {{ target }}, OSPF moved everything to wan2 and
+              the full loopback mesh is still reachable. This is the failure
+              that has no link-state signal at all -- WireGuard tunnels never
+              go down on their own -- so OSPF's hello timers (or BFD under
+              them) are the only thing that noticed.
+
+      always:
+        - name: "chaos/wan | RESTORE the tunnels"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + [undo] }}"
+          changed_when: true
+
+        - name: "chaos/wan | disarm the deadman"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + [deadman_disarm] }}"
+          changed_when: true
+          failed_when: false
+
+        - name: "chaos/wan | wait for the adjacencies to come back"
+          ansible.builtin.pause:
+            seconds: "{{ converge_wait }}"
+
+    # =================================================================
+    #  3. A firewall's session dies.
+    #
+    #  Drop one customer eBGP session on one edge router. The VIPs it carries
+    #  must still be reachable, because the firewall peers with BOTH ERs and
+    #  the other one is still holding them. And the /25 must still be
+    #  originated, because the home-anchor guard is watching the union of the
+    #  customer claims, not any single session.
+    #
+    #  This is the scenario the whole customer-grant model exists for, and the
+    #  one where "BGP is up" tells you the least.
+    # =================================================================
+    - name: "chaos | customer"
+      when:
+        - scenario in ['all', 'customer']
+        - routers[first_er].customers | length > 0
+      vars:
+        target: "{{ first_er }}"
+        victim: "{{ routers[first_er].customers | first }}"
+        ssh_base: "{{ ['ssh', '-p', ssh_port | string] + ros_ssh_opts
+                      + [router_user ~ '@' ~ routers[first_er][addr_key]] }}"
+        undo: "/routing/bgp/connection enable [find where name~\"cust-\"]"
+      block:
+        - name: "chaos/customer | arm the deadman on {{ target }}"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + [deadman_arm] }}"
+          changed_when: true
+
+        - name: "chaos/customer | DISABLE {{ victim.session }} on {{ target }}"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + ['/routing/bgp/connection disable [find where name=\"' ~ victim.session ~ '\"]'] }}"
+          changed_when: true
+
+        - name: "chaos/customer | let the withdrawal propagate"
+          ansible.builtin.pause:
+            seconds: "{{ converge_wait }}"
+
+        - name: "chaos/customer | the path is unaffected"
+          ansible.builtin.command:
+            argv: "{{ egress_check }}"
+          changed_when: false
+          register: egress
+          retries: 5
+          delay: 15
+          until: egress.rc == 0
+
+        - name: "chaos/customer | the /25 is still originated somewhere"
+          ansible.builtin.command:
+            argv: "{{ ['ssh', '-p', ssh_port | string] + ros_ssh_opts
+                       + [router_user ~ '@' ~ routers[item][addr_key]]
+                       + ['/ip/route print count-only where blackhole && !disabled'] }}"
+          register: still_anchored
+          changed_when: false
+          failed_when: false
+          loop: "{{ manifest.routers | dict2items
+                    | selectattr('value.role', 'equalto', 'er')
+                    | map(attribute='key') | list }}"
+
+        - name: "chaos/customer | at least one ER still holds an enabled home-anchor"
+          ansible.builtin.assert:
+            that: >-
+              still_anchored.results
+              | map(attribute='stdout') | map('trim') | map('int') | select('>', 0)
+              | list | length > 0
+            fail_msg: >-
+              Dropping {{ victim.name }} from {{ target }} withdrew the home
+              anchor on EVERY edge router. It should only be withdrawn when no
+              customer claim is live anywhere -- and {{ victim.name }} still
+              peers with the other ER. Check the home-anchor guard.
+            success_msg: >-
+              The /25 is still originated with {{ victim.name }} dropped from
+              {{ target }} -- the other ER is carrying it.
+
+        - name: "chaos/customer | PASS"
+          ansible.builtin.debug:
+            msg: >-
+              {{ victim.name }}'s session to {{ target }} is down and nothing
+              downstream noticed. This is what a firewall peering with both ERs
+              buys, and it is the reason the eBGP session -- not a ping -- is
+              the health signal for the /25.
+
+      always:
+        - name: "chaos/customer | RESTORE the customer sessions"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + [undo] }}"
+          changed_when: true
+
+        - name: "chaos/customer | disarm the deadman"
+          ansible.builtin.command:
+            argv: "{{ ssh_base + [deadman_disarm] }}"
+          changed_when: true
+          failed_when: false
+
+        - name: "chaos/customer | wait for the session to come back"
+          ansible.builtin.pause:
+            seconds: "{{ converge_wait }}"
+
+# Everything was restored above, but "restored" is a claim like any other. The
+# run ends by re-proving the whole fleet with the SAME gate the pipeline uses,
+# so a chaos session can't quietly leave something disabled.
+- name: Chaos — the fleet is back where it started
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: "chaos | re-run the full functional gate"
+      ansible.builtin.command:
+        argv: [pytest, "{{ playbook_dir }}/../tests/functional", "-q"]
+      changed_when: false

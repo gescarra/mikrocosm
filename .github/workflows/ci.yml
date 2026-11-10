@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install wireguard-tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends wireguard-tools
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Unit tests
+        run: pytest
+      - name: Validate the example topology
+        run: python generate.py --check
+      - name: Render the example topology offline
+        run: ./demo.sh

@@ -1,0 +1,239 @@
+<mxfile host="drawio"><diagram name="architecture"><mxGraphModel dx="1400" dy="900" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2760" pageHeight="2300" math="0" shadow="0" adaptiveColors="auto">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+
+    <mxCell id="title" value="&lt;b style=&quot;font-size:22px&quot;&gt;AS64500 — WireGuard · OSPF+BFD · iBGP · eBGP architecture&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:13px&quot;&gt;203.0.113.0/24 · 2001:DB8::/40 (ARIN) · example.net · dual-stack throughout · rendered from topology.yml&lt;/span&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=13;" vertex="1" parent="1">
+      <mxGeometry x="200" y="16" width="1420" height="64" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="vultr" value="&lt;b&gt;VULTR — AS64515&lt;/b&gt;&amp;nbsp; upstream / transit&lt;br&gt;&lt;br&gt;eBGP v4 &amp;nbsp;local 198.51.100.57 ↔ remote 169.254.169.254&lt;br&gt;eBGP v6 &amp;nbsp;local 2001:db8:f000:4126:5400:6ff:fe12:3456&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;↔ remote 2001:19f0:ffff::1&lt;br&gt;multihop · TCP-MD5 · listen=yes connect=yes · 2 separate sessions&lt;br&gt;&lt;b&gt;in&lt;/b&gt;&amp;nbsp; : default only (0.0.0.0/0 · ::/0) — filter-nlri drops the full table&lt;br&gt;&lt;b&gt;out&lt;/b&gt;: 203.0.113.0/24 + 2001:DB8::/42 only" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;spacingRight=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="200" y="100" width="520" height="170" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="hosthatch" value="&lt;b&gt;HOSTHATCH — AS65473&lt;/b&gt;&amp;nbsp; upstream / transit&lt;br&gt;&lt;br&gt;eBGP v4 &amp;nbsp;local 198.51.100.200 ↔ remote 169.254.169.254&lt;br&gt;eBGP v6 &amp;nbsp;local 2001:db8:f001:a595::179 ↔ remote 2605:4840:ffff::179&lt;br&gt;multihop · TCP-MD5 · listen=yes connect=yes · 2 separate sessions&lt;br&gt;&lt;b&gt;MANDATORY community 65500:10000&lt;/b&gt; — without it the DDoS-scrubbing&lt;br&gt;platform does not propagate the announcement at all&lt;br&gt;&lt;b&gt;in&lt;/b&gt;&amp;nbsp; : default only&amp;nbsp;&amp;nbsp;&lt;b&gt;out&lt;/b&gt;: 203.0.113.0/24 + 2001:DB8::/42" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;spacingRight=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1100" y="100" width="520" height="170" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="dfz" value="&lt;b&gt;Public Internet / DFZ&lt;/b&gt;&lt;br&gt;&lt;br&gt;also carries the WireGuard&lt;br&gt;&lt;b&gt;underlay&lt;/b&gt;: BR ether1 ↔ ER wan1/wan2" style="ellipse;shape=cloud;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=11;fontFamily=Courier New;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="760" y="100" width="300" height="170" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="br1" value="&lt;b&gt;br1.ord1&lt;/b&gt;&amp;nbsp; —&amp;nbsp; br1.ord1.example.net&lt;br&gt;MikroTik CHR · site ord1 (Vultr) · AS64500&lt;br&gt;&lt;br&gt;&lt;b&gt;lo0&lt;/b&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; 203.0.113.241 &amp;nbsp;·&amp;nbsp; 2001:db8::b1&lt;br&gt;router-id 203.0.113.241 &amp;nbsp;(BGP + OSPFv2 + OSPFv3)&lt;br&gt;&lt;b&gt;ether1&lt;/b&gt;&amp;nbsp; 198.51.100.57/25 &amp;nbsp;gw 198.51.100.1&lt;br&gt;&lt;b&gt;ether1&lt;/b&gt;&amp;nbsp; 2001:db8:f000:4126:5400:6ff:fe12:3456/64 &amp;nbsp;gw ← RA&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; (EUI-64 from ether1 MAC — pinned to the instance)&lt;br&gt;static default @ distance 30&lt;br&gt;&lt;br&gt;&lt;b&gt;originates&lt;/b&gt; 203.0.113.0/24 + 2001:DB8::/42&lt;br&gt;&amp;nbsp;&amp;nbsp;via the anchor route (blackhole @ distance 254)&lt;br&gt;&lt;b&gt;default-guard&lt;/b&gt;: stops default-originate to the ERs when eBGP&lt;br&gt;&amp;nbsp;&amp;nbsp;drops — gated per-AFI on the SESSION, not on route presence" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;spacingRight=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="200" y="380" width="520" height="270" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="br2" value="&lt;b&gt;br2.ord2&lt;/b&gt;&amp;nbsp; —&amp;nbsp; br2.ord2.example.net&lt;br&gt;MikroTik CHR · site ord2 (HostHatch) · AS64500&lt;br&gt;&lt;br&gt;&lt;b&gt;lo0&lt;/b&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; 203.0.113.242 &amp;nbsp;·&amp;nbsp; 2001:db8::b2&lt;br&gt;router-id 203.0.113.242 &amp;nbsp;(BGP + OSPFv2 + OSPFv3)&lt;br&gt;&lt;b&gt;ether1&lt;/b&gt;&amp;nbsp; 198.51.100.200/25 &amp;nbsp;gw 198.51.100.129&lt;br&gt;&lt;b&gt;ether1&lt;/b&gt;&amp;nbsp; 2001:db8:f001:a595::179/64 &amp;nbsp;gw fe80::1%ether1&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; (fixed link-local gw — must be interface-scoped)&lt;br&gt;static default @ distance 30&lt;br&gt;&lt;br&gt;&lt;b&gt;originates&lt;/b&gt; 203.0.113.0/24 + 2001:DB8::/42&lt;br&gt;&amp;nbsp;&amp;nbsp;via the anchor route (blackhole @ distance 254)&lt;br&gt;&lt;b&gt;default-guard&lt;/b&gt;: v4 and v6 gated independently, so a dead v6&lt;br&gt;&amp;nbsp;&amp;nbsp;session cannot strand v4 (or black-hole v6)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;spacingRight=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1100" y="380" width="520" height="270" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="backbone" value="&lt;b&gt;BACKBONE TUNNEL&lt;/b&gt;&lt;br&gt;wg-br2 (br1) ↔ wg-br1 (br2)&lt;br&gt;&lt;br&gt;203.0.113.160/31&lt;br&gt;&amp;nbsp;&amp;nbsp;br1 .160 · br2 .161&lt;br&gt;2001:db8:0:10::/127&lt;br&gt;&amp;nbsp;&amp;nbsp;br1 ::0 · br2 ::1&lt;br&gt;&lt;br&gt;UDP 51102 ↔ 51101&lt;br&gt;MTU 1360 · PSK · keepalive 25s&lt;br&gt;&lt;br&gt;OSPF ptp cost 5 · 5s / 20s&lt;br&gt;BFD 200ms × 3 → ~600ms" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="760" y="410" width="300" height="210" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="er1" value="&lt;b&gt;er1.hdc&lt;/b&gt;&amp;nbsp; —&amp;nbsp; er1.hdc.example.net&lt;br&gt;MikroTik · site hdc · AS64500&lt;br&gt;&lt;br&gt;&lt;b&gt;lo0&lt;/b&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; 203.0.113.249 &amp;nbsp;·&amp;nbsp; 2001:db8::e1&lt;br&gt;router-id 203.0.113.249 &amp;nbsp;(BGP + OSPFv2 + OSPFv3)&lt;br&gt;&lt;b&gt;wan1 ether1&lt;/b&gt;&amp;nbsp; 192.0.2.186/28 gw 192.0.2.190 — fibre, cost 10&lt;br&gt;&lt;b&gt;wan2 ether2&lt;/b&gt;&amp;nbsp; DHCP, CGNAT 5G — no fixed addr, cost 100&lt;br&gt;&lt;b&gt;ether3&lt;/b&gt;&amp;nbsp; xc&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; 203.0.113.224/31 · 2001:db8:0:40::/127&lt;br&gt;&lt;b&gt;ether4&lt;/b&gt;&amp;nbsp; transit 203.0.113.233/29 · 2001:DB8:0:41::1/64&lt;br&gt;&lt;br&gt;egress pinning: routing-table &lt;b&gt;via-wan1&lt;/b&gt; (UDP dst 51820-51829)&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; &lt;b&gt;via-wan2&lt;/b&gt; (UDP dst 51920-51929)&lt;br&gt;&lt;b&gt;originates&lt;/b&gt; 203.0.113.0/25 + 2001:DB8:1::/48&lt;br&gt;&amp;nbsp;&amp;nbsp;— only while a customer VIP is actually being advertised&lt;br&gt;mgmt SSH from 192.0.2.176/28 · user netops (keys from keys_url)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;spacingRight=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="200" y="1150" width="520" height="340" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="er2" value="&lt;b&gt;er2.hdc&lt;/b&gt;&amp;nbsp; —&amp;nbsp; er2.hdc.example.net&lt;br&gt;MikroTik · site hdc · AS64500&lt;br&gt;&lt;br&gt;&lt;b&gt;lo0&lt;/b&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; 203.0.113.250 &amp;nbsp;·&amp;nbsp; 2001:db8::e2&lt;br&gt;router-id 203.0.113.250 &amp;nbsp;(BGP + OSPFv2 + OSPFv3)&lt;br&gt;&lt;b&gt;wan1 ether1&lt;/b&gt;&amp;nbsp; 192.0.2.187/28 gw 192.0.2.190 — fibre, cost 10&lt;br&gt;&lt;b&gt;wan2 ether2&lt;/b&gt;&amp;nbsp; DHCP, CGNAT 5G — no fixed addr, cost 100&lt;br&gt;&lt;b&gt;ether3&lt;/b&gt;&amp;nbsp; xc&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; 203.0.113.225/31 · 2001:db8:0:40::1/127&lt;br&gt;&lt;b&gt;ether4&lt;/b&gt;&amp;nbsp; transit 203.0.113.234/29 · 2001:DB8:0:41::2/64&lt;br&gt;&lt;br&gt;egress pinning: routing-table &lt;b&gt;via-wan1&lt;/b&gt; (UDP dst 51820-51829)&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; &lt;b&gt;via-wan2&lt;/b&gt; (UDP dst 51920-51929)&lt;br&gt;&lt;b&gt;originates&lt;/b&gt; 203.0.113.0/25 + 2001:DB8:1::/48&lt;br&gt;&amp;nbsp;&amp;nbsp;— identical config; the two ERs are deliberately symmetric&lt;br&gt;NOTE: today wan2 is wired to a dummy router — all four ER&lt;br&gt;&amp;nbsp;&amp;nbsp;tunnels currently share the wan1 underlay" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;spacingRight=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1100" y="1150" width="520" height="340" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="xc" value="&lt;b&gt;ER ↔ ER INTERCONNECT&lt;/b&gt;&lt;br&gt;ether3 — wired Ethernet, one rack&lt;br&gt;&lt;b&gt;no WireGuard&lt;/b&gt;&lt;br&gt;&lt;br&gt;203.0.113.224/31&lt;br&gt;&amp;nbsp;&amp;nbsp;er1 .224 · er2 .225&lt;br&gt;2001:db8:0:40::/127&lt;br&gt;&lt;br&gt;OSPF ptp cost 1 · default 40s&lt;br&gt;BFD 100ms × 3 → ~300ms&lt;br&gt;&lt;br&gt;BFD is here for the failure that&lt;br&gt;does NOT drop carrier — a live-&lt;br&gt;but-not-forwarding sibling" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="760" y="1220" width="300" height="200" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="transit" value="&lt;b&gt;hdc CUSTOMER TRANSIT SEGMENT&lt;/b&gt; — shared L2 on ether4 of BOTH ERs · no VRRP&lt;br&gt;&lt;br&gt;&lt;b&gt;203.0.113.232/29&lt;/b&gt; — er1 .233 · er2 .234 · fwa .236 · fwb .237&lt;br&gt;&lt;b&gt;2001:DB8:0:41::/64&lt;/b&gt; — er1 ::1 · er2 ::2 · fwa ::10 · fwb ::11 &amp;nbsp;(a real /64: shared L2 with multiple firewalls, not a P2P link)&lt;br&gt;OSPF &lt;b&gt;passive&lt;/b&gt; on ether4 — customers are never OSPF neighbours, an adjacency would hand them the internal topology&lt;br&gt;BFD &lt;b&gt;forbid-bfd=yes&lt;/b&gt; on ether4 — the one place inside the AS where untrusted speakers live&lt;br&gt;Every firewall runs eBGP with &lt;b&gt;both&lt;/b&gt; ERs over this segment: 4 v4 + 4 v6 sessions total" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=top;spacingLeft=14;spacingTop=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="200" y="1580" width="1420" height="150" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="fwa" value="&lt;b&gt;fwa.hdc — pfSense&lt;/b&gt;&lt;br&gt;&lt;b&gt;AS65010&lt;/b&gt; (private) · fwa.hdc.example.net&lt;br&gt;&lt;br&gt;203.0.113.236 &amp;nbsp;·&amp;nbsp; 2001:DB8:0:41::10&lt;br&gt;&lt;br&gt;eBGP&amp;nbsp; → er1 203.0.113.233 &lt;b&gt;and&lt;/b&gt; er2 203.0.113.234&lt;br&gt;eBGP6 → er1 2001:DB8:0:41::1 &lt;b&gt;and&lt;/b&gt; er2 ::2&lt;br&gt;local.role = ebgp-customer&lt;br&gt;&lt;br&gt;&lt;b&gt;GRANT&lt;/b&gt; delegation 203.0.113.0/28 up to /32&lt;br&gt;&lt;b&gt;GRANT&lt;/b&gt; delegation 2001:DB8:1:100::/56 up to /64&lt;br&gt;&amp;nbsp;&amp;nbsp;(256 × /64 LANs for fwa to carve up)&lt;br&gt;&lt;b&gt;receives&lt;/b&gt;: 0.0.0.0/0 and ::/0 ONLY&lt;br&gt;&amp;nbsp;&amp;nbsp;→ ECMP egress across er1 + er2 (replaces VRRP)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;spacingRight=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="200" y="1810" width="520" height="262" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="fwb" value="&lt;b&gt;fwb.hdc — pfSense&lt;/b&gt;&lt;br&gt;&lt;b&gt;AS65011&lt;/b&gt; (private) · fwb.hdc.example.net&lt;br&gt;&lt;br&gt;203.0.113.237 &amp;nbsp;·&amp;nbsp; 2001:DB8:0:41::11&lt;br&gt;&lt;br&gt;eBGP&amp;nbsp; → er1 203.0.113.233 &lt;b&gt;and&lt;/b&gt; er2 203.0.113.234&lt;br&gt;eBGP6 → er1 2001:DB8:0:41::1 &lt;b&gt;and&lt;/b&gt; er2 ::2&lt;br&gt;local.role = ebgp-customer&lt;br&gt;&lt;br&gt;&lt;b&gt;GRANT&lt;/b&gt; vip 203.0.113.16/32&lt;br&gt;&lt;b&gt;GRANT&lt;/b&gt; vip 2001:DB8:1::16/128&lt;br&gt;&lt;br&gt;&lt;b&gt;receives&lt;/b&gt;: default only → ECMP egress across er1 + er2&lt;br&gt;two firewalls advertising the same VIP at equal&lt;br&gt;local-pref ⇒ inbound ECMP; set distinct local_pref&lt;br&gt;instead for deterministic primary/backup" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;spacingRight=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1100" y="1810" width="520" height="262" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="custsess" value="&lt;b&gt;eBGP CUSTOMER POLICY&lt;/b&gt;&lt;br&gt;&lt;br&gt;8 sessions = 2 fw × 2 ER × 2 AFI&lt;br&gt;&lt;br&gt;&lt;b&gt;inbound&lt;/b&gt; is the security boundary:&lt;br&gt;one accept rule per grant, then a&lt;br&gt;terminal &lt;b&gt;reject&lt;/b&gt;. A firewall gets&lt;br&gt;exactly what topology.yml grants&lt;br&gt;it and nothing else.&lt;br&gt;&lt;br&gt;&lt;b&gt;outbound&lt;/b&gt; (cust-out / cust6-out):&lt;br&gt;accept 0.0.0.0/0 · ::/0, reject all&lt;br&gt;→ no internal prefix can ever leak&lt;br&gt;&amp;nbsp;&amp;nbsp; to a customer&lt;br&gt;&lt;br&gt;The live VIP advertisement is the&lt;br&gt;ONLY health signal for the /25 —&lt;br&gt;real reachability, not a ping." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="760" y="1810" width="300" height="262" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e_br1_vultr" style="edgeStyle=none;html=1;rounded=0;strokeColor=#d79b00;strokeWidth=3;endArrow=none;startArrow=none;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="br1" target="vultr">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="l_br1_vultr" value="&lt;b&gt;eBGP&lt;/b&gt; v4 + v6&lt;br&gt;AS64500 ↔ AS64515&lt;br&gt;TCP-MD5 · multihop" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=4;" vertex="1" connectable="0" parent="e_br1_vultr">
+      <mxGeometry x="0" relative="1" as="geometry"><mxPoint x="150" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_br2_hh" style="edgeStyle=none;html=1;rounded=0;strokeColor=#d79b00;strokeWidth=3;endArrow=none;startArrow=none;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="br2" target="hosthatch">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="l_br2_hh" value="&lt;b&gt;eBGP&lt;/b&gt; v4 + v6&lt;br&gt;AS64500 ↔ AS65473&lt;br&gt;TCP-MD5 · multihop" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=4;" vertex="1" connectable="0" parent="e_br2_hh">
+      <mxGeometry x="0" relative="1" as="geometry"><mxPoint x="-150" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_vultr_dfz" style="edgeStyle=none;html=1;rounded=0;dashed=1;strokeColor=#999999;strokeWidth=2;endArrow=none;startArrow=none;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="vultr" target="dfz">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_hh_dfz" style="edgeStyle=none;html=1;rounded=0;dashed=1;strokeColor=#999999;strokeWidth=2;endArrow=none;startArrow=none;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="hosthatch" target="dfz">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e_bb_l" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=3;endArrow=none;startArrow=none;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="br1" target="backbone">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_bb_r" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=3;endArrow=none;startArrow=none;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="backbone" target="br2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e_xc_l" style="edgeStyle=none;html=1;rounded=0;strokeColor=#666666;strokeWidth=3;endArrow=none;startArrow=none;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="er1" target="xc">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_xc_r" style="edgeStyle=none;html=1;rounded=0;strokeColor=#666666;strokeWidth=3;endArrow=none;startArrow=none;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="xc" target="er2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="t1" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=2;endArrow=none;startArrow=none;exitX=0.15;exitY=1;exitDx=0;exitDy=0;entryX=0.1;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="br1" target="er1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="t1l" value="&lt;b&gt;wan1&lt;/b&gt; · .192 ↔ .193&lt;br&gt;OSPF 10 · BFD 300ms×4" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="t1">
+      <mxGeometry x="-0.35" relative="1" as="geometry"><mxPoint x="-100" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="t2" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=none;startArrow=none;exitX=0.35;exitY=1;exitDx=0;exitDy=0;entryX=0.3;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="br1" target="er1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="t2l" value="&lt;b&gt;wan2&lt;/b&gt; · .194 ↔ .195&lt;br&gt;OSPF 100 · BFD 1s×5" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="t2">
+      <mxGeometry x="0.15" relative="1" as="geometry"><mxPoint x="110" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="t3" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=2;endArrow=none;startArrow=none;exitX=0.65;exitY=1;exitDx=0;exitDy=0;entryX=0.1;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="br1" target="er2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="t3l" value="&lt;b&gt;wan1&lt;/b&gt; · .196 ↔ .197&lt;br&gt;OSPF 10 · BFD 300ms×4" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="t3">
+      <mxGeometry x="-0.5" relative="1" as="geometry"><mxPoint y="-30" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="t4" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=none;startArrow=none;exitX=0.85;exitY=1;exitDx=0;exitDy=0;entryX=0.3;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="br1" target="er2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="t4l" value="&lt;b&gt;wan2&lt;/b&gt; · .198 ↔ .199&lt;br&gt;OSPF 100 · BFD 1s×5" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="t4">
+      <mxGeometry x="0.5" relative="1" as="geometry"><mxPoint y="30" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="t5" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=2;endArrow=none;startArrow=none;exitX=0.15;exitY=1;exitDx=0;exitDy=0;entryX=0.7;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="br2" target="er1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="t5l" value="&lt;b&gt;wan1&lt;/b&gt; · .200 ↔ .201&lt;br&gt;OSPF 10 · BFD 300ms×4" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="t5">
+      <mxGeometry x="-0.5" relative="1" as="geometry"><mxPoint y="30" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="t6" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=none;startArrow=none;exitX=0.35;exitY=1;exitDx=0;exitDy=0;entryX=0.9;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="br2" target="er1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="t6l" value="&lt;b&gt;wan2&lt;/b&gt; · .202 ↔ .203&lt;br&gt;OSPF 100 · BFD 1s×5" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="t6">
+      <mxGeometry x="0.5" relative="1" as="geometry"><mxPoint y="-30" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="t7" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=2;endArrow=none;startArrow=none;exitX=0.65;exitY=1;exitDx=0;exitDy=0;entryX=0.7;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="br2" target="er2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="t7l" value="&lt;b&gt;wan1&lt;/b&gt; · .204 ↔ .205&lt;br&gt;OSPF 10 · BFD 300ms×4" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="t7">
+      <mxGeometry x="-0.35" relative="1" as="geometry"><mxPoint x="108" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="t8" style="edgeStyle=none;html=1;rounded=0;strokeColor=#9673a6;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=none;startArrow=none;exitX=0.85;exitY=1;exitDx=0;exitDy=0;entryX=0.9;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="br2" target="er2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="t8l" value="&lt;b&gt;wan2&lt;/b&gt; · .206 ↔ .207&lt;br&gt;OSPF 100 · BFD 1s×5" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="t8">
+      <mxGeometry x="0.15" relative="1" as="geometry"><mxPoint x="-110" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_er1_tr" style="edgeStyle=none;html=1;rounded=0;strokeColor=#666666;strokeWidth=3;endArrow=none;startArrow=none;exitX=0.35;exitY=1;exitDx=0;exitDy=0;entryX=0.15;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="er1" target="transit">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="l_er1_tr" value="ether4 · .233 · ::1" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#fff2cc;strokeColor=#d6b656;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="e_er1_tr">
+      <mxGeometry x="0" relative="1" as="geometry"><mxPoint x="-75" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_er2_tr" style="edgeStyle=none;html=1;rounded=0;strokeColor=#666666;strokeWidth=3;endArrow=none;startArrow=none;exitX=0.65;exitY=1;exitDx=0;exitDy=0;entryX=0.85;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="er2" target="transit">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="l_er2_tr" value="ether4 · .234 · ::2" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#fff2cc;strokeColor=#d6b656;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="e_er2_tr">
+      <mxGeometry x="0" relative="1" as="geometry"><mxPoint x="75" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_tr_fwa" style="edgeStyle=none;html=1;rounded=0;dashed=1;strokeColor=#b85450;strokeWidth=3;endArrow=none;startArrow=none;exitX=0.15;exitY=1;exitDx=0;exitDy=0;entryX=0.4;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="transit" target="fwa">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="l_tr_fwa" value="&lt;b&gt;eBGP&lt;/b&gt; AS65010 ↔ AS64500&lt;br&gt;to er1 .233 AND er2 .234 (+ v6)" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#f8cecc;strokeColor=#b85450;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="e_tr_fwa">
+      <mxGeometry x="0" relative="1" as="geometry"><mxPoint x="-125" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_tr_fwb" style="edgeStyle=none;html=1;rounded=0;dashed=1;strokeColor=#b85450;strokeWidth=3;endArrow=none;startArrow=none;exitX=0.85;exitY=1;exitDx=0;exitDy=0;entryX=0.6;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="transit" target="fwb">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="l_tr_fwb" value="&lt;b&gt;eBGP&lt;/b&gt; AS65011 ↔ AS64500&lt;br&gt;to er1 .233 AND er2 .234 (+ v6)" style="edgeLabel;html=1;labelBackgroundColor=#ffffff;rounded=1;fillColor=#f8cecc;strokeColor=#b85450;align=center;verticalAlign=middle;fontSize=10;fontFamily=Courier New;spacing=3;" vertex="1" connectable="0" parent="e_tr_fwb">
+      <mxGeometry x="0" relative="1" as="geometry"><mxPoint x="125" as="offset"/></mxGeometry>
+    </mxCell>
+
+    <mxCell id="p_ibgp" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#6c8ebf;strokeWidth=2;align=left;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="1700" y="100" width="960" height="460" as="geometry"/>
+    </mxCell>
+    <mxCell id="p_ibgp_txt" value="&lt;b style=&quot;font-size:14px&quot;&gt;iBGP — FULL MESH, no route reflector · AS64500&lt;/b&gt;&lt;br&gt;&lt;br&gt;4 routers ⇒ 6 pairs ⇒ &lt;b&gt;6 v4 sessions + 6 v6 sessions = 12&lt;/b&gt;&lt;br&gt;v4 and v6 are SEPARATE sessions, not one session with two AFIs, so&lt;br&gt;nexthop-choice=force-self stays trivially correct (no RFC 5549) and&lt;br&gt;a filter mistake in one family cannot take the other down.&lt;br&gt;&lt;br&gt;peering &amp;nbsp;: &lt;b&gt;loopback ↔ loopback&lt;/b&gt; · multihop=yes · force-self&lt;br&gt;v4 pairs: .241↔.242 · .241↔.249 · .241↔.250&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;.242↔.249 · .242↔.250 · .249↔.250&lt;br&gt;v6 pairs: ::b1↔::b2 · ::b1↔::e1 · ::b1↔::e2&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;::b2↔::e1 · ::b2↔::e2 · ::e1↔::e2&lt;br&gt;&lt;br&gt;&lt;b&gt;BR → ER&lt;/b&gt; : output.default-originate=if-installed&lt;br&gt;&lt;b&gt;BR → BR&lt;/b&gt; : NEVER a default — it would point a BR&#39;s own tunnel-&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; endpoint route back into the tunnel&lt;br&gt;&lt;b&gt;ER → BR&lt;/b&gt; : 203.0.113.0/25 + 2001:DB8:1::/48 only; customer&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; VIP more-specifics stay home&lt;br&gt;&lt;b&gt;ER → ER&lt;/b&gt; : same, except VIP more-specifics ARE permitted&lt;br&gt;&lt;b&gt;all&lt;/b&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; : never leak the aggregate into iBGP — every BR&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; originates it locally&lt;br&gt;&lt;br&gt;&lt;b&gt;large communities&lt;/b&gt;: 64500:1:666 RTBH (explicit, via the rtbh list)&lt;br&gt;64500:1:1xxx origin site tag (1001 hdc · 1002 ord1 · 1003 ord2)&lt;br&gt;64500:2:1|2|3 prepend ×n · 64500:3:&amp;lt;asn&amp;gt; do-not-announce to that AS" style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1716" y="118" width="600" height="440" as="geometry"/>
+    </mxCell>
+    <mxCell id="mesh_cap" value="&lt;b&gt;the mesh&lt;/b&gt;&lt;br&gt;every pair peers directly" style="text;html=1;align=center;verticalAlign=top;whiteSpace=wrap;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="2330" y="120" width="310" height="44" as="geometry"/>
+    </mxCell>
+    <mxCell id="m_br1" value="br1&lt;br&gt;.241 / ::b1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="2330" y="180" width="120" height="48" as="geometry"/>
+    </mxCell>
+    <mxCell id="m_br2" value="br2&lt;br&gt;.242 / ::b2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="2520" y="180" width="120" height="48" as="geometry"/>
+    </mxCell>
+    <mxCell id="m_er1" value="er1&lt;br&gt;.249 / ::e1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="2330" y="390" width="120" height="48" as="geometry"/>
+    </mxCell>
+    <mxCell id="m_er2" value="er2&lt;br&gt;.250 / ::e2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="2520" y="390" width="120" height="48" as="geometry"/>
+    </mxCell>
+    <mxCell id="me1" style="edgeStyle=none;html=1;dashed=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=none;startArrow=none;" edge="1" parent="1" source="m_br1" target="m_br2"><mxGeometry relative="1" as="geometry"/></mxCell>
+    <mxCell id="me2" style="edgeStyle=none;html=1;dashed=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=none;startArrow=none;" edge="1" parent="1" source="m_er1" target="m_er2"><mxGeometry relative="1" as="geometry"/></mxCell>
+    <mxCell id="me3" style="edgeStyle=none;html=1;dashed=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=none;startArrow=none;" edge="1" parent="1" source="m_br1" target="m_er1"><mxGeometry relative="1" as="geometry"/></mxCell>
+    <mxCell id="me4" style="edgeStyle=none;html=1;dashed=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=none;startArrow=none;" edge="1" parent="1" source="m_br2" target="m_er2"><mxGeometry relative="1" as="geometry"/></mxCell>
+    <mxCell id="me5" style="edgeStyle=none;html=1;dashed=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=none;startArrow=none;" edge="1" parent="1" source="m_br1" target="m_er2"><mxGeometry relative="1" as="geometry"/></mxCell>
+    <mxCell id="me6" style="edgeStyle=none;html=1;dashed=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=none;startArrow=none;" edge="1" parent="1" source="m_br2" target="m_er1"><mxGeometry relative="1" as="geometry"/></mxCell>
+    <mxCell id="mesh_note" value="6 pairs × 2 address families&lt;br&gt;= 12 iBGP sessions total" style="text;html=1;align=center;verticalAlign=top;whiteSpace=wrap;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="2330" y="455" width="310" height="44" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="p_ospf" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#82b366;strokeWidth=2;align=left;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="1700" y="590" width="960" height="440" as="geometry"/>
+    </mxCell>
+    <mxCell id="p_ospf_txt" value="&lt;b style=&quot;font-size:14px&quot;&gt;OSPF + BFD — one area, two instances, dual-stack&lt;/b&gt;&lt;br&gt;&lt;br&gt;OSPFv2 instance &lt;b&gt;core&lt;/b&gt; &amp;nbsp;area &lt;b&gt;bb&lt;/b&gt;&amp;nbsp; = 0.0.0.0 &amp;nbsp;&amp;nbsp;·&amp;nbsp;&amp;nbsp; OSPFv3 instance &lt;b&gt;core6&lt;/b&gt; area &lt;b&gt;bb6&lt;/b&gt; = 0.0.0.0&lt;br&gt;router-id = the &lt;b&gt;v4 loopback&lt;/b&gt; in BOTH instances (an OSPFv3 router-id is still 32-bit — an identifier, not an address)&lt;br&gt;Costs are IDENTICAL in both families, so a single link failure moves both or neither — never debug a failure twice.&lt;br&gt;Enabled on: lo0 (passive) · tun-bb / tun-wan1 / tun-wan2 (ptp) · ether3 (ptp) · ether4 (passive, customer-facing)&lt;br&gt;&lt;br&gt;&lt;b&gt;BR↔BR backbone&lt;/b&gt; · cost 5 &amp;nbsp; · hello 5s / dead 20s &amp;nbsp;· BFD 200ms × 3 → detect ~600ms &amp;nbsp;(was 20s)&lt;br&gt;&lt;b&gt;wan1 tunnels&lt;/b&gt; &amp;nbsp;&amp;nbsp;· cost 10 &amp;nbsp;· hello 5s / dead 20s &amp;nbsp;· BFD 300ms × 4 → detect ~1.2s &amp;nbsp;&amp;nbsp;(was 20s)&lt;br&gt;&lt;b&gt;wan2 tunnels&lt;/b&gt; &amp;nbsp;&amp;nbsp;· cost 100 · hello 10s / dead 40s · BFD 1s × 5 &amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;→ detect ~5s &amp;nbsp;&amp;nbsp;&amp;nbsp;(was 40s)&lt;br&gt;&lt;b&gt;er1 ↔ er2 xc&lt;/b&gt; &amp;nbsp;&amp;nbsp;· cost 1 &amp;nbsp;&amp;nbsp;· default 40s dead &amp;nbsp;&amp;nbsp;· BFD 100ms × 3 → detect ~300ms &amp;nbsp;(was 40s)&lt;br&gt;&lt;br&gt;WAN preference is expressed &lt;b&gt;only&lt;/b&gt; as OSPF cost — never in BGP, never in a name. Promoting wan2 is a two-line change.&lt;br&gt;&lt;br&gt;&lt;b&gt;BFD is additive.&lt;/b&gt; /routing/bfd/configuration only PERMITS a session; use-bfd=yes on the OSPF interface-template is&lt;br&gt;what asks for one. If a BFD session never establishes, the network behaves exactly as it did before BFD existed.&lt;br&gt;&lt;b&gt;Default is DENY&lt;/b&gt; — ether1 (upstream) is simply absent from the menu and ether4 carries an explicit forbid-bfd=yes,&lt;br&gt;so neither an upstream nor a customer can ever negotiate BFD with us. OSPFv2 and OSPFv3 build their own sessions&lt;br&gt;per link and inherit the same class timers (the config entries match on interface, not family). BFD is UDP/3784,&lt;br&gt;already covered by in-interface-list=tunnels in the input chain, in both families.&lt;br&gt;&lt;br&gt;&lt;b&gt;WireGuard interfaces never go down on their own&lt;/b&gt; — OSPF hellos plus BFD are the only liveness detector here." style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1716" y="608" width="930" height="410" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="p_wg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#9673a6;strokeWidth=2;align=left;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="1700" y="1060" width="960" height="470" as="geometry"/>
+    </mxCell>
+    <mxCell id="p_wg_txt" value="&lt;b style=&quot;font-size:14px&quot;&gt;WireGuard overlay — 9 point-to-point tunnels&lt;/b&gt;&lt;br&gt;MTU 1360 (worst underlay − 60) · MSS clamp 1320 · pre-shared key on every peer · persistent-keepalive 25s&lt;br&gt;allowed-address = 0.0.0.0/0,::/0 everywhere — routing is OSPF&#39;s job, not WireGuard&#39;s (::/0 is mandatory for v6)&lt;br&gt;naming = the FAR END, local view: on er1 the tunnel to br1 over wan1 is &lt;b&gt;wg-br1-wan1&lt;/b&gt;; on br1 it is &lt;b&gt;wg-er1-wan1&lt;/b&gt;&lt;br&gt;&lt;br&gt;br1↔er1 wan1 | .192 ↔ .193 | 2001:db8:0:30::0/127 | er1:51001 → br1:51821 | cost 10 | BFD 300ms×4&lt;br&gt;br1↔er1 wan2 | .194 ↔ .195 | 2001:db8:0:30::2/127 | er1:51101 → br1:51921 | cost 100 | BFD 1s×5&lt;br&gt;br1↔er2 wan1 | .196 ↔ .197 | 2001:db8:0:30::4/127 | er2:51001 → br1:51822 | cost 10 | BFD 300ms×4&lt;br&gt;br1↔er2 wan2 | .198 ↔ .199 | 2001:db8:0:30::6/127 | er2:51101 → br1:51922 | cost 100 | BFD 1s×5&lt;br&gt;br2↔er1 wan1 | .200 ↔ .201 | 2001:db8:0:30::8/127 | er1:51002 → br2:51821 | cost 10 | BFD 300ms×4&lt;br&gt;br2↔er1 wan2 | .202 ↔ .203 | 2001:db8:0:30::a/127 | er1:51102 → br2:51921 | cost 100 | BFD 1s×5&lt;br&gt;br2↔er2 wan1 | .204 ↔ .205 | 2001:db8:0:30::c/127 | er2:51002 → br2:51822 | cost 10 | BFD 300ms×4&lt;br&gt;br2↔er2 wan2 | .206 ↔ .207 | 2001:db8:0:30::e/127 | er2:51102 → br2:51922 | cost 100 | BFD 1s×5&lt;br&gt;&lt;b&gt;br1↔br2 bbone&lt;/b&gt;| .160 ↔ .161 | 2001:db8:0:10::0/127 | br1:51102 ↔ br2:51101 | cost 5 &amp;nbsp;| BFD 200ms×3&lt;br&gt;&lt;br&gt;&lt;b&gt;PORT SCHEME&lt;/b&gt; — the BR listen port is what selects which ER WAN the outer packet leaves by:&lt;br&gt;&amp;nbsp;&amp;nbsp;BR listens &lt;b&gt;5182x&lt;/b&gt; = wan1 side, &lt;b&gt;5192x&lt;/b&gt; = wan2 side &amp;nbsp;(x = ER index) &amp;nbsp;· backbone: BR listens 51100 + far BR index&lt;br&gt;&amp;nbsp;&amp;nbsp;ER listens &lt;b&gt;5100x&lt;/b&gt; = wan1 side, &lt;b&gt;5110x&lt;/b&gt; = wan2 side &amp;nbsp;(x = BR index)&lt;br&gt;&amp;nbsp;&amp;nbsp;ER mangle marks the WG outer packet: UDP dst 51820-51829 → via-wan1 &amp;nbsp;· 51920-51929 → via-wan2&lt;br&gt;wan2 is CGNAT&#39;d 5G: no inbound port exists, so the &lt;b&gt;ER always initiates&lt;/b&gt; — endpoint-address is set on the ER side only.&lt;br&gt;Private keys live in keys.json (gitignored), generated once and never regenerated." style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1716" y="1078" width="930" height="440" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="p_addr" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#d6b656;strokeWidth=2;align=left;verticalAlign=top;" vertex="1" parent="1">
+      <mxGeometry x="1700" y="1560" width="960" height="510" as="geometry"/>
+    </mxCell>
+    <mxCell id="p_addr_txt" value="&lt;b style=&quot;font-size:14px&quot;&gt;Addressing plan, origination and RPKI · AS64500&lt;/b&gt;&lt;br&gt;&lt;b&gt;allocated&lt;/b&gt;: 203.0.113.0/24 (ARIN) · 2001:DB8::/40 (ARIN) &amp;nbsp;&amp;nbsp;&lt;b&gt;announced&lt;/b&gt;: 203.0.113.0/24 · &lt;b&gt;2001:DB8::/42&lt;/b&gt;&lt;br&gt;&lt;br&gt;&lt;b&gt;.0/25&lt;/b&gt; &amp;nbsp;&amp;nbsp;customer home, pfSense VIPs &amp;nbsp;&amp;nbsp;→ v6 2001:DB8:1::/48&lt;br&gt;&lt;b&gt;.128/27&lt;/b&gt; remote-site delegations (sites: [] — none live yet)&lt;br&gt;&lt;b&gt;.160/28&lt;/b&gt; BR↔BR backbone /31s &amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;→ v6 2001:DB8:0:10::/60&lt;br&gt;&lt;b&gt;.176/28&lt;/b&gt; remote-site tunnel /31s &amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;→ v6 2001:DB8:0:20::/60&lt;br&gt;&lt;b&gt;.192/27&lt;/b&gt; BR↔ER tunnel /31s (16) &amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;→ v6 2001:DB8:0:30::/60 &amp;nbsp;(/127s, RFC 6164)&lt;br&gt;&lt;b&gt;.224/28&lt;/b&gt; ER xc + customer transit &amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;→ v6 2001:DB8:0:40::/60&lt;br&gt;&lt;b&gt;.240/28&lt;/b&gt; loopbacks &amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;→ v6 2001:DB8:0:0::/60 &amp;nbsp;&amp;nbsp;(br → ::b1/::b2 · er → ::e1/::e2)&lt;br&gt;&lt;br&gt;&lt;b&gt;Why /42 and not /40:&lt;/b&gt; 2001:DB8:FC::/46 is reserved for AWS BYOIP and is deliberately OUTSIDE the announced&lt;br&gt;aggregate, because AWS originates it (AS14618 / AS16509), not us. The BRs hold the announced aggregate as a&lt;br&gt;blackhole at distance 254 — if that anchor covered the AWS range, internal traffic to our own AWS /48s would&lt;br&gt;match it and be dropped while the rest of the internet reached them fine. One DFZ entry, exactly like the /40.&lt;br&gt;&lt;br&gt;&lt;b&gt;RPKI ROAs — all of these are required&lt;/b&gt;&lt;br&gt;&amp;nbsp;&amp;nbsp;2001:DB8::/40 &amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;— AS64500 — maxLength 40 &amp;nbsp;(keeps the unannounced rest of the /40 un-hijackable)&lt;br&gt;&amp;nbsp;&amp;nbsp;2001:DB8::/42 &amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;— AS64500 — maxLength 42 &amp;nbsp;(without this the /42 is INVALID, not Unknown — worse)&lt;br&gt;&amp;nbsp;&amp;nbsp;2001:DB8:FC::/46 &amp;nbsp;— AS14618 &amp;nbsp;— maxLength 48 &amp;nbsp;(AWS BYOIP)&lt;br&gt;&amp;nbsp;&amp;nbsp;2001:DB8:FC::/46 &amp;nbsp;— AS16509 &amp;nbsp;— maxLength 48 &amp;nbsp;(AWS BYOIP — the ASN is region-dependent, so BOTH)&lt;br&gt;&amp;nbsp;&amp;nbsp;203.0.113.0/24 &amp;nbsp;&amp;nbsp;— AS64500 — maxLength 24 &amp;nbsp;(the v4 equivalent)&lt;br&gt;&lt;br&gt;&lt;b&gt;DNS · example.net&lt;/b&gt; &amp;nbsp;bare router name → loopback · interface addrs → {interface}.{router}.{site}.example.net&lt;br&gt;No DNS names in router configs — BGP, OSPF and anchor-guard use literal IPs, so a DNS outage cannot affect routing.&lt;br&gt;The WAN PTRs the world sees in a traceroute (198.51.100.57, 198.51.100.200) are set in the provider panel." style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1716" y="1578" width="930" height="480" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="legend" value="&lt;b&gt;LEGEND&lt;/b&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp; &lt;font color=&quot;#d79b00&quot;&gt;&lt;b&gt;━━&lt;/b&gt;&lt;/font&gt; eBGP to upstream (AS64515 / AS65473)&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; &lt;font color=&quot;#9673a6&quot;&gt;&lt;b&gt;━━&lt;/b&gt;&lt;/font&gt; WireGuard tunnel carrying OSPFv2 + OSPFv3 + BFD (solid = wan1 / backbone, dashed = wan2)&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; &lt;font color=&quot;#b85450&quot;&gt;&lt;b&gt;┅┅&lt;/b&gt;&lt;/font&gt; eBGP to customer pfSense (AS65010 / AS65011)&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; &lt;font color=&quot;#6c8ebf&quot;&gt;&lt;b&gt;┅┅&lt;/b&gt;&lt;/font&gt; iBGP, loopback ↔ loopback (drawn as the inset mesh, top right — it overlays every link below and is not tied to any one of them)&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp; &lt;font color=&quot;#666666&quot;&gt;&lt;b&gt;━━&lt;/b&gt;&lt;/font&gt; wired L2 / physical" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999999;align=left;verticalAlign=middle;spacingLeft=14;fontSize=11;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="200" y="2130" width="2460" height="72" as="geometry"/>
+    </mxCell>
+
+  </root>
+</mxGraphModel>
+</diagram></mxfile>

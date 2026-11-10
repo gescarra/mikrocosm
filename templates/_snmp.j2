@@ -1,0 +1,100 @@
+{# =====================================================================
+   SNMPv3 agent. INCLUDED LAST BY br.rsc.j2, er.rsc.j2 AND site.rsc.j2.
+
+   LAST ON PURPOSE, and it's the only block in this repo placed by that
+   argument. /import is strictly ordered (AD-LOG §20.2) and the deploy path
+   runs it straight after reset-configuration (README): a line RouterOS
+   rejects doesn't merely fail, it abandons every line below it on a box that
+   has already been wiped. The two properties here whose ACCEPTED VALUES vary
+   across RouterOS versions (authentication-protocol and encryption-protocol
+  ) are therefore the last thing in the file. Get them wrong and you lose
+   monitoring, which you find out about from the outside; anywhere else in the
+   file you would lose the firewall, which you wouldn't.
+
+   Monitoring is the canary. You put the canary at the end of the mine, not
+   at the entrance.
+
+   The input-chain accept and the `snmp` address-list are deliberately NOT
+   here. They live with the rest of the firewall, where their position
+   relative to the terminal drop is visible on the page.
+
+   Needs `t`, `r.fqdn` and `r.snmp_location`.
+   ===================================================================== #}
+{% if t.snmp is defined and t.snmp %}
+
+# =====================================================================
+#  SNMP: read-only monitoring plane
+# =====================================================================
+# --- the v1/v2c default, armed or not --------------------------------
+# RouterOS ships exactly one community: name="public", security=none. Any host
+# the firewall lets through can read the entire MIB (interfaces, addresses,
+# neighbours, routes, serial numbers) using a string that has been the same
+# on every device on earth since 1988. On a CHR whose ether1 faces the DFZ
+# that isn't an information leak, it's a UDP amplifier with someone else's
+# name on the return address.
+#
+# read-access=no rather than remove: /snmp trap-community still points at
+# "public" by default, and removing a referenced object is exactly the kind of
+# line whose behaviour varies by version. Denying it read is total (the
+# community can no longer answer anything) and it can't fail.
+:if ([:len [/snmp/community/find where name="public"]] > 0) do={ /snmp/community/set [find where name="public"] read-access=no write-access=no }
+{% if t.snmp.enabled %}
+
+# --- the one v3 user -------------------------------------------------
+# security=private is RouterOS for authPriv: authenticated AND encrypted.
+# There's no v2c fallback configured anywhere, so a poller that can't do v3
+# doesn't get a degraded answer. It gets no answer.
+#
+# read-access=yes, write-access=no. The write side isn't theoretical on
+# RouterOS: `snmpset` to 1.3.6.1.4.1.14988.1.1.7.1.0 reboots the router, and
+# 1.3.6.1.2.1.1.5.0 renames it. Monitoring needs neither.
+#
+# remove-then-add, matching the ssh-key import in _mgmt.j2, so that re-running
+# this file against a LIVE router replaces the entry instead of failing on a
+# duplicate name. The remove is a no-op when nothing matches.
+#
+# The passphrases below come from keys.json, never from topology.yml. They are
+# 32 URL-safe characters, which is also why they can be quoted here without
+# any escaping worth thinking about.
+/snmp/community/remove [find where name="{{ t.snmp.user }}"]
+/snmp/community/add name={{ t.snmp.user }} security=private read-access=yes write-access=no \
+    authentication-protocol={{ t.snmp.auth_protocol }} authentication-password="{{ t.snmp.auth_password }}" \
+    encryption-protocol={{ t.snmp.encryption_protocol }} encryption-password="{{ t.snmp.priv_password }}"
+
+# location is this router's own site, not a fleet-wide constant. See the
+# note in topology.yml. sysName is already /system/identity ({{ r.fqdn }}).
+#
+# engine-id-suffix IS THE LINE THAT MAKES MORE THAN ONE ROUTER POLLABLE.
+# RouterOS does NOT derive a per-device engine-id: with the suffix empty it's
+# 80003a8c04 (MikroTik's enterprise number, text format, nothing after it) on
+# every box, measured on 7.24.5 across all four routers. SNMPv3 keys its
+# time-window state (engineBoots/engineTime) by engine-id, so a poller that
+# sees four agents claiming one identity keeps the clock of whichever answered
+# first and discards every other router's replies as outside the window.
+# Zabbix reports that as "Timeout while connecting", indistinguishable from a
+# firewall drop. The symptom is exactly one host working.
+#
+# The suffix is the router's identity: already unique fleet-wide (DNS and
+# keys.json both depend on it), it survives a CHR rebuild, and it makes
+# `/snmp print` say which box it's. generate.py holds it to the 27 octets an
+# engine-id has room for after the 5-octet prefix. CHANGING IT on a live box
+# means restarting zabbix-server, which caches engine state in-process.
+#
+# NO TRAPS. trap-target stays at its 0.0.0.0 default, so this agent never
+# sends anything unasked. Zabbix polls; a v3 trap would additionally require
+# the RECEIVER to be taught each router's engine-id. Per-router state to
+# maintain in exchange for duplicating data we already collect on a 1m interval.
+/snmp
+set enabled=yes engine-id-suffix="{{ r.fqdn }}" contact="{{ t.snmp.contact }}" location="{{ r.snmp_location }}"
+{% else %}
+
+# NOT ARMED (snmp.enabled: false in topology.yml). Two deliberate effects, and
+# both of them are worth having on their own:
+#   - the agent is turned off EXPLICITLY, not left at whatever the default is
+#   - no credential is rendered into this file at all, so a pass-1 .rsc that
+#     ends up somewhere it shouldn't leaks nothing
+# Flip snmp.enabled, put the poller in snmp.sources, rebuild, redeploy.
+/snmp
+set enabled=no
+{% endif %}
+{% endif %}

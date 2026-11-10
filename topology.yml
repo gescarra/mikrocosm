@@ -1,0 +1,1199 @@
+# =====================================================================
+#  AS64500: topology
+#
+#  WORKED EXAMPLE. Every number below is from the documentation ranges
+#  (AS64500, 203.0.113.0/24, 198.51.100.0/24, 192.0.2.0/24, 2001:DB8::/32,
+#  example.net). It renders out of the box so you can read real output;
+#  replace the values with your own before deploying anything.
+#
+#  This file is the SINGLE SOURCE OF TRUTH. Commit it.
+#  It contains NO secrets: WireGuard keys live in keys.json (gitignored),
+#  are generated once, and are never regenerated unless you ask.
+#
+#  Everything derivable is DERIVED, not listed here:
+#    - tunnel /31s, loopbacks, listen ports, interface names, key pairings
+#  See generate.py. If you hand-edit a /31 here, you have made a mistake.
+#  (Everyone makes it once. Make yours in a branch.)
+# =====================================================================
+
+asn: 64500
+prefix: 203.0.113.0/24
+
+# --- blocks (must match the doc's §5 addressing plan) -----------------
+blocks:
+  customer_home:  203.0.113.0/25      # -> pfSense
+  site_deleg:     203.0.113.128/27    # remote-site /29s
+  backbone:       203.0.113.160/28    # BR<->BR /31s
+  site_p2p:       203.0.113.176/28    # remote-site tunnel /31s
+  br_er_p2p:      203.0.113.192/27    # BR<->ER /31s
+  local_links:    203.0.113.224/28    # ER interconnect + pfSense transit
+  loopbacks:      203.0.113.240/28
+
+# --- IPv6 (ARIN 2001:DB8::/40) ---------------------------------------
+# See docs/addressing-v6.md for the reasoning behind every number here.
+#
+# prefix_v6 IS THE MASTER SWITCH: setting it turns IPv6 on everywhere, and
+# generate.py then refuses to render any BR lacking a wan_v6 block rather than
+# quietly building a v6-less border router.
+#
+# Sites get a /48 each (RFC 6177), allocated sequentially from 01 and never
+# reused. Infrastructure sits at 00; AWS BYOIP is pinned at the top of the /40
+# so growth from the bottom can't collide with it.
+prefix_v6: 2001:DB8::/40
+
+# What the BRs actually ORIGINATE. Deliberately smaller than the allocation.
+#
+# prefix_v6 is what ARIN gave us; aggregate_v6 is what we announce. In v4 those
+# are the same object (we announce the whole /24), which is why `prefix` needs
+# no counterpart. In v6 they must differ, because part of the /40 is delegated
+# to AWS and originated by Amazon (AS14618/AS16509). Not by us.
+#
+# WHY NOT JUST ANNOUNCE THE /40 AND LET LONGEST-PREFIX-MATCH SORT IT OUT:
+# externally that works fine: AWS's /48 beats our /40 for the outside world.
+# The problem is INTERNAL. The BRs hold the announced aggregate as a blackhole
+# at distance 254 (the origination anchor, see docs/origination.md). If that
+# anchor covered the AWS range, traffic from inside AS64500 to our own AWS
+# /48s would match the blackhole and be dropped, while the rest of the internet
+# reached them normally via AWS. Announcing only the space we actually route
+# removes the AWS range from our table entirely, so internal traffic falls
+# through to the default and reaches AWS the same way anyone else does.
+#
+# WHY ONE PREFIX AND NOT SEVERAL: carving the /40 around FC::/46 would take
+# seven prefixes (/42+/42+/42+/43+/44+/45+/46). This is one DFZ entry, exactly
+# like the /40 was, and 00-3F is 64 /48s. Infra + hdc + 62 sites of headroom.
+# Everything from 40:: up is simply unannounced, which isn't the same as lost.
+#
+# !! RPKI: THIS NEEDS ITS OWN ROA. A ROA for the /40 at maxLength 40 makes a
+# !! /42 announcement INVALID (RFC 6811) (covered by a ROA, validated by
+# !! none) which is WORSE than no ROA, because validating networks actively
+# !! drop Invalid where they would have accepted Unknown. Required ROAs:
+# !!     2001:DB8::/40      AS64500   maxLength 40   <- keep: makes the
+# !!                                                      unannounced rest of
+# !!                                                      the /40 Invalid for
+# !!                                                      anyone else to hijack
+# !!     2001:DB8::/42      AS64500   maxLength 42   <- makes THIS valid
+# !!     2001:DB8:FC::/46   AS14618    maxLength 48   <- AWS, BOTH are required
+# !!     2001:DB8:FC::/46   AS16509    maxLength 48   <- (see below)
+# !!
+# !! Yes, a ROA can be MORE dangerous than no ROA. Welcome to BGP, where
+# !! being half right is a career-limiting event.
+aggregate_v6: 2001:DB8::/42
+
+# Reserved for AWS BYOIP. Contiguous because these four /48s are the one place
+# inside the /40 where the origin AS is NOT 64500. Deliberately OUTSIDE
+# aggregate_v6: generate.py refuses to render if the two ever overlap.
+#
+# AWS needs TWO ROAs, one per Amazon ASN: it advertises BYOIP space from either
+# AS14618 or AS16509 depending on the region. Authorise only one and the regions
+# using the other come out RPKI Invalid. Two ROAs for the same prefix with
+# different origins is legal: a route is Valid if ANY ROA validates it.
+#
+# And because we keep the /40 ROA (which covers this range with origin 64500),
+# a missing or wrong-ASN AWS ROA makes these /48s INVALID, not merely Unknown.
+# Validating networks drop Invalid outright, so there's no soft-failure mode:
+# get the ROAs right BEFORE AWS starts advertising.
+aws_byoip_v6: 2001:DB8:FC::/46
+
+# All infrastructure lives in 2001:DB8:0::/48, one /60 per class. The 4th
+# hextet's leading nibble is the category. P2P links are /127 (RFC 6164), the
+# exact /31 analog. Offsets within each block reuse the v4 index arithmetic
+# verbatim; only the base changes.
+blocks_v6:
+  customer_home:  2001:DB8:1::/48        # the hdc site /48 (203.0.113.0/25 analog)
+  loopbacks:      2001:DB8:0:0000::/60   # /128s: br->::b1,::b2  er->::e1,::e2
+  backbone:       2001:DB8:0:0010::/60   # BR<->BR /127s
+  site_p2p:       2001:DB8:0:0020::/60   # remote-site tunnel /127s
+  br_er_p2p:      2001:DB8:0:0030::/60   # BR<->ER tunnel /127s
+  local_links:    2001:DB8:0:0040::/60   # ER interconnect + firewall transit
+  peer_p2p:       2001:DB8:0:0050::/60   # EXTERNAL peering /127s (see `peers:`)
+
+# --- global -----------------------------------------------------------
+domain:        example.net
+dns:
+  forward_zone_id: Z00000000EXAMPLEFWD1
+  reverse_zone_id: Z00000000EXAMPLEREV4
+  # The /40 is nibble-aligned, so ARIN delegates one clean zone:
+  #   0.0.8.b.d.0.1.0.0.2.ip6.arpa
+  reverse_v6_zone_id: Z00000000EXAMPLEREV6
+
+# NOT the block above. `dns:` is where we PUBLISH records (Route 53 zone ids);
+# this is what the routers themselves RESOLVE with.
+#
+# Public anycast, deliberately: no router on this fleet may depend on internal
+# DNS. The edge is what you use to reach everything else, so it can't be behind
+# anything else. RouterOS has no choice in the matter anyway: /ip/dns is a
+# forwarding cache with no root hints and no recursion, so it MUST be given
+# upstreams. The only way to a real recursive resolver here is a container, and
+# a container in the break-glass path is a worse trade than trusting anycast.
+#
+# Two operators on two anycast clouds, dual-stack: a v4-only list would make a
+# bad day on v4 transit cost us name resolution too. 9.9.9.10 is Quad9's
+# UNFILTERED address on purpose: 9.9.9.9 applies a threat feed, and a false
+# positive there would NXDOMAIN mgmt_prefixes_url, which is the one name that
+# has to resolve when everything else is already broken.
+# It's always DNS. Except here, where we made very sure it can't be.
+dns_servers:
+  - 1.1.1.1                    # Cloudflare
+  - 8.8.8.8                    # Google
+  - 9.9.9.10                   # Quad9, unfiltered
+  - 2606:4700:4700::1111       # Cloudflare v6
+  - 2001:4860:4860::8888       # Google v6
+
+# Time, by IP rather than by name, so the clock doesn't depend on the resolver.
+# This isn't fussiness: both fetch URLs run check-certificate=yes, and a CHR
+# that boots with a skewed clock fails cert validation on every fetch. That
+# failure is SAFE (guard 1. mgmt-refresh changes nothing) but silent except
+# for one log line, and it looks exactly like an endpoint outage. Same class of
+# trap as the empty /certificate store noted at mgmt_refresh below.
+# A router that doesn't know what year it's will refuse every certificate
+# on earth, and it will be very polite about it.
+#
+# These are the anycast addresses behind time.cloudflare.com and time.google.com.
+# RouterOS 7 accepts hostnames in `servers=` too, if you would rather have the
+# names re-resolve than have the addresses go stale.
+ntp_servers:
+  - 162.159.200.1              # time.cloudflare.com
+  - 162.159.200.123            # time.cloudflare.com
+  - 216.239.35.0               # time.google.com
+  - 216.239.35.4               # time.google.com
+
+wg_mtu:        1360      # measure your worst underlay first! (smallest MTU - 60)
+mss_clamp:     1320      # wg_mtu - 40  (20 IPv4 + 20 TCP)
+# There's deliberately no mss_clamp_v6 here. It's DERIVED as wg_mtu - 60
+# (40 IPv6 + 20 TCP) = 1300, because MSS is what survives the headers and the v6
+# header is twice the v4 one. Listing it buys nothing and generate.py rejects any
+# value but the derived one. See the note in derive().
+
+# --- BR WAN interface queue (AQM on ether1) ---------------------------
+# THE ROUTEROS DEFAULT IS WRONG FOR THESE BOXES, and by a lot. Ethernet ships on
+# `only-hardware-queue`, which removes the software queue and hands packets
+# straight to the driver's TX ring. On real hardware, with a deep ring and
+# working backpressure, that's the fast path and this knob should stay unset.
+#
+# A CHR guest on an OVERSUBSCRIBED VPS is the case it gets wrong. The virtio ring
+# only drains when the host's vhost thread is scheduled; when the hypervisor
+# deschedules it the ring stops draining and fills, and with no software queue in
+# front, every packet arriving in that window is dropped on the floor. Those are
+# the tx-queue-drops. Each one is a TCP loss signal, so every sender crossing
+# this router halves its window. Which is why the symptom is a soft throughput
+# cap at a CPU sitting near 6%. The router isn't busy. It's discarding packets
+# during someone else's scheduling gaps.
+# Your router is fine. Your noisy neighbour on that hypervisor is mining
+# something.
+#
+# This is the SAME environmental fact the backbone BFD timers are already tuned
+# around ("a hypervisor scheduling gap of a few hundred ms is normal", bfd.links
+# below). Same root cause, two symptoms; the queue had simply never been tuned.
+#
+# MEASURED on br1.ord1, RouterOS 7.24.1 (2026-08-31):
+#
+#   fq-codel (the `virtual` type below) ..... ~200 Mb/s, fewest drops
+#   pfifo, 50 packets (ethernet-default) .... ~60 Mb/s, more drops
+#   only-hardware-queue ..................... worst; the original complaint
+#
+# Absolute numbers on an oversubscribed host move with what the neighbours are
+# doing: an earlier run of the same comparison put pfifo near 150. Trust the
+# ORDERING, which has been stable across runs, not the figures.
+#
+# WHY fq-codel WINS HERE, and it's not generic AQM enthusiasm: a deep tail-drop
+# FIFO is the wrong shape for a bursty stall. 50 packets is under a millisecond
+# of buffer at these rates, so a scheduling gap overruns it and tail-drops the
+# whole burst; 500 would absorb the gap but add standing latency for everyone.
+# fq-codel decouples the two: a 10240-packet backlog to absorb the stall, with
+# CoDel dropping on measured sojourn time so the latency THROUGH that backlog
+# stays near target. Flow isolation is the second win: every control plane on a
+# BR shares ether1 (eBGP to the upstream, plus the outer UDP of all five
+# WireGuard tunnels carrying OSPF, iBGP and 200ms BFD), and under a single pfifo
+# a saturating transit flow queues ahead of BFD packets whose detect budget is
+# ~600ms. It costs CPU, which this router has 94% of.
+#
+# !! NOTE WHAT fq-codel CAN AND CANNOT SEE HERE. It classifies the packets on
+# !! ether1, which for tunnelled traffic are the ENCRYPTED OUTER packets: one
+# !! UDP flow per tunnel. So it isolates the five tunnels and eBGP from each
+# !! other (which is the control-plane win above) but it does NOT give
+# !! per-customer-flow fairness, because every customer inside a tunnel shares
+# !! one outer flow. Per-customer isolation would have to happen where the inner
+# !! packets are visible: on the wg-* interfaces, or at the ER. The wg-*
+# !! interfaces are deliberately left at RouterOS's `no-queue` default. The
+# !! drops are on ether1, and a second buffering layer in front of the encrypt
+# !! path would add latency without addressing them. Measure before changing it.
+#
+# `wan_queue` is written VERBATIM into `/queue/interface set ... queue=`, so it
+# must name a type that EXISTS on the router. This is a real trap: fq-codel is a
+# `kind`, not a type name. There's no stock `/queue/type` called `fq-codel`,
+# so `wan_queue: fq-codel` would fail at import, on a box reset-configuration
+# has already wiped, and every line after it (all of BGP, every tunnel) would
+# never run. The type has to be CREATED first, which is what wan_aqm below does
+# and what validate() now enforces against the stock 7.24.1 name list.
+#
+# Per-BR override: put `wan_queue:` on a border_routers entry to A/B one box
+# against the other: they sit on different providers and need not agree.
+wan_queue: virtual
+
+# The custom type the template CREATES when wan_queue names it. Every value is
+# the RouterOS 7.24.1 fq-codel default, pinned explicitly rather than inherited:
+# these are the knobs a future release could move under us, and a silent change
+# to target or limit would show up as a throughput regression nobody could
+# attribute. `virtual` is the name already deployed on the BRs. Kept so the
+# name on the box doesn't change under existing monitoring.
+wan_aqm:
+  name:     virtual
+  target:   5ms          # CoDel sojourn-time target
+  interval: 100ms        # CoDel measurement window
+  limit:    10240        # hard backlog cap, packets: absorbs the host stall
+  flows:    1024         # hash buckets for flow isolation
+  quantum:  1514         # bytes served per flow per round; one full frame
+  memlimit: 32.0MiB      # backlog ceiling in bytes, whichever binds first
+  # MEASURED INERT ON THE TUNNELLED PATH, and left on anyway. Sniffed ether1
+  # filtered to a WG port on br1.ord1 (2026-08-31): 43,439 outer packets, ALL
+  # Not-ECT (ip.dsfield.ecn == 0, no exceptions). CoDel can't mark a Not-ECT
+  # packet, so on this path it's dropping, never marking. The 200 Mb/s came
+  # entirely from CoDel's drop behaviour, the deep backlog and flow isolation,
+  # not from ECN. Nothing here is broken; this dimension is simply asleep.
+  #
+  # The capture does NOT say WHY, and the two candidates have different
+  # consequences. Either RouterOS's WireGuard doesn't copy the inner codepoint
+  # onto the outer header (RFC 6040), or the customer traffic was Not-ECT to
+  # begin with and a correct implementation faithfully copied 00 -> 00. The
+  # second is very plausible: classic TCP ECN is rarely NEGOTIATED in the wild
+  # (most clients never request it), and endpoints are the only thing that can
+  # negotiate it: a transit router can mark, never negotiate.
+  #
+  # To tell them apart, sniff a wg-* interface directly and read the INNER bits.
+  # Inner also all-zero means no customer traffic negotiates ECN, and the whole
+  # ECN thread is a dead end here regardless of what RouterOS implements.
+  # Including the idea of moving the marking queue onto the wg-* interfaces,
+  # which would otherwise mark the real end-to-end header and need no tunnel
+  # propagation at all. That's the one decision this distinction changes.
+  #
+  # Kept `yes` because it costs nothing and starts working by itself if either
+  # cause goes away. Setting it `no` would only force a drop where a mark might
+  # one day have done.
+  # ECN: the feature everyone supports and nobody actually negotiates.
+  ecn:      yes
+
+# --- management source addresses --------------------------------------
+# THE FLOOR. Every prefix here is committed, rendered into every router, and
+# can only be removed by an edit + rebuild + redeploy. `mgmt-refresh` (the
+# on-router script) is forbidden from touching these, so a bad API response
+# can never take away the access you committed. Break-glass lives here.
+#
+# v4 ONLY: see AD-LOG §1343. The v6 input chains have no mgmt hole at all,
+# so a v6 entry here would be silently useless. generate.py rejects one.
+
+mgmt_prefixes:
+  - 203.0.113.0/24
+
+# Optional. Fetched at BUILD time by generate.py and UNIONed with the floor
+# above; also baked into the on-router `mgmt-refresh` script, which re-fetches
+# it on a schedule so a changed admin address doesn't need a config push.
+# Union, never replace: the API can only ADD to the floor, never subtract from
+# it. Same one-line-per-entry, `#`-comments-ignored format as keys_url.
+mgmt_prefixes_url: https://a.example.net/mgmtprefixes
+
+# --- management SSH access --------------------------------------------
+# Public keys are fetched from keys_url at BUILD TIME and imported into every
+# router for this user. Public keys aren't secrets, so the URL and username
+# live here; the keys themselves are pulled fresh on each build and never
+# stored in the repo. On each import the user's existing keys are cleared and
+# re-imported, so this is the single source of truth for who can log in.
+ssh:
+  user:      netops
+  keys_url:  https://a.example.net/sshkeys
+
+# --- automation login: the CI runner ----------------------------------
+# A SECOND user, deliberately separate from the human one above, and with the
+# opposite key lifecycle.
+#
+#   ssh.user     PEOPLE. Keys are device-tied and churn (a laptop is added,
+#                a phone is retired) so they are FETCHED from keys_url at
+#                build time and the on-router mgmt-refresh script re-pulls
+#                them. The set is whatever the endpoint says today.
+#   automation   A MACHINE. One keypair, generated once, tied to nothing but
+#                the runner. It doesn't churn, so it's not fetched: the
+#                public half is written HERE, committed, reviewed in a diff.
+#
+# Keeping them apart is what makes each one revocable without touching the
+# other. Deleting this block and deploying removes CI's access to the fleet
+# and leaves every human login untouched; the reverse is equally true.
+#
+# THE PUBLIC HALF IS NOT A SECRET. That's what "public" means, and it's why
+# this file can still promise it holds none. The PRIVATE half lives only in
+# GitLab as a protected, File-type variable and never touches the repo.
+# tests/unit/test_secrets.py fails the build if anything key-shaped shows up in
+# an artifact.
+#
+# >>> CHICKEN AND EGG: this user doesn't exist on a router until a config
+# >>> creating it has been applied, and the runner can't apply that config
+# >>> because the user doesn't exist yet. Break it once from a workstation
+# >>> that already has access:
+# >>>     ssh-keygen -t ed25519 -f ~/.ssh/as64500-ci -N ""
+# >>>     <paste the .pub below>  ->  ./build.sh  ->  ansible-playbook deploy.yml
+# >>> After that the runner is autonomous. See docs/netdevops.md.
+#
+# Omit the whole block and nothing is rendered. A fleet with no CI is the
+# state this repo was in before the pipeline existed, and it still builds.
+automation:
+  user: gitlab-runner
+
+  # The RouterOS group. `full` is the honest default and the comment explains
+  # why, but see docs/netdevops.md before narrowing it: the deploy primitive is
+  # reset-configuration, and a user that can wipe and reload a router has
+  # effective full control no matter what its policy list says. What a narrower
+  # group buys isn't least privilege. It's closing the OTHER doors (winbox,
+  # the REST API, packet sniffing, and reading secrets back out of /export).
+  #
+  # `automation` is a group generate.py renders for you from this list. Set
+  # `group: full` to use the builtin instead.
+  #
+  # Everything NOT listed here is rendered as an explicit `!denial` rather than
+  # left out. RouterOS does deny unlisted policies (three of the four routers
+  # showed `!sensitive` from a render that never mentioned it) but br1 was
+  # found GRANTING `sensitive` from the same config, so something (an earlier
+  # render, a manual edit) had diverged and nothing would have noticed. The
+  # denials make the effective group provably equal to this list instead of
+  # equal-if-nobody-touched-it. State a group exactly, since
+  # reading it back is the only way to know what it says.
+  group: automation
+  policies:
+    - ssh        # log in at all
+    - ftp        # scp the .rsc up. RouterOS puts SCP under the ftp policy.
+    - read       # every probe in tests/functional
+    - write      # apply config
+    - test       # /ping: the loopback mesh and the MTU proof
+    - reboot     # the second reboot after a reset
+    # `policy` is REQUIRED for /system/reset-configuration, which is the whole
+    # deploy primitive. Determined on a live router, not from documentation:
+    # with everything else granted the reset was still refused with
+    #     not enough permissions (9) (/system/reset-configuration; line 1)
+    # and adding `policy` was what let it through. It makes sense in hindsight:
+    # reset-configuration destroys and recreates the user database, which is
+    # exactly what keep-users=yes exists to qualify.
+    #
+    # >>> AND IT MEANS THIS GROUP IS NOT A SECURITY BOUNDARY. `policy` is user
+    # >>> management: this account can grant itself anything it's missing. Do
+    # >>> not read the denials below as containment. An account that can run
+    # >>> reset-configuration owns the router regardless, and this just makes
+    # >>> that explicit rather than implied.
+    - policy
+    # (Least privilege, RouterOS edition: pick any two of "least",
+    # "privilege" and "the deploy works".)
+  #
+  # The denials are still worth having, for what they actually are: they stop
+  # an ACCIDENT and they close the DIRECT paths. A leaked runner key can't
+  # open WinBox, drive the REST API, capture traffic, or dump secrets out of
+  # /export without first deciding to escalate. Which is a different and
+  # noisier thing than doing it by default.
+  #   sensitive        -> /export and print redact keys and passwords
+  #   winbox web api rest-api romon  -> no GUI or API path
+  #   sniff            -> can't capture traffic
+  #   password         -> can't change anyone's login
+  #   local telnet     -> console and telnet closed
+  #
+  # >>> VERIFY ON ONE ROUTER BEFORE THE FLEET. Where a missing policy bites
+  # >>> decides how bad it's: scp failing is harmless (nothing has happened),
+  # >>> reset failing is harmless (it's refused, the box doesn't reboot.
+  # >>> measured), but a missing `read` fails the verify gate on a box that's
+  # >>> already live.
+
+  # The runner's public key. One per line if you ever run more than one runner.
+  keys:
+    - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC gitlab-runner@hdc    # PLACEHOLDER: paste your runner's public key
+
+# --- mgmt-refresh: pull keys + source addresses on a schedule ---------
+# Keeps `keys_url` and `mgmt_prefixes_url` applied WITHOUT a config push. Off
+# by default, and rendered inert when off: `enabled: false` still installs the
+# script (so you can run it by hand and watch the log) but installs no
+# scheduler, so nothing runs unattended until you say so.
+#
+# >>> ROLL OUT IN TWO PASSES, same discipline as bfd above:
+# >>>   pass 1: enabled=false -> deploy everywhere, then on ONE router run
+# >>>           /system/script/run mgmt-refresh  and read /log.
+# >>>   pass 2: enabled=true  -> deploy everywhere. Armed.
+#
+# REQUIRES a CA trust store on the router for check-certificate=yes. A CHR
+# with an empty /certificate store fails every fetch. Safely (the script
+# changes nothing), but also permanently and silently except for the log line.
+mgmt_refresh:
+  enabled:  false
+  interval: 1h
+
+# --- SNMPv3: the read-only monitoring plane ---------------------------
+# ONE v3 user, authPriv, read-only, polled by Zabbix. There's no v1 and no
+# v2c anywhere on this fleet: a community string is a password sent in
+# cleartext over UDP, and RouterOS ships with one already configured and named
+# `public`. The template neutralises that default entry whether this block is
+# enabled or not: an agent answering `public` on a public-WAN CHR isn't an
+# information leak, it's an amplification reflector pointed at someone else.
+#
+# THREE LOCKS. Each one alone would make the other two boring; that's the
+# point of having three:
+#   1. `sources` below -> an accept for udp/161 in EVERY router's input chain,
+#      above the terminal drop. This is the statement that decides who may send
+#      this router an SNMP packet at all. Everything else meets the same drop
+#      that everything else meets.
+#   2. security=private -> authPriv. The poller proves it knows the auth
+#      passphrase, and the whole PDU is encrypted. An observer on the path
+#      learns nothing; an on-path forger gets nowhere.
+#   3. read-access=yes, write-access=no -> SNMP can't CHANGE this router.
+#      That isn't academic on RouterOS: an snmpset to 1.3.6.1.4.1.14988.1.1.7.1.0
+#      reboots the box, and MikroTik documents it as a feature.
+#      A feature. For whom, exactly, has never been made clear.
+#
+# THE PASSPHRASES ARE NOT IN THIS FILE, which is what keeps the promise at the
+# top of it. They are generated once into keys.json (mode 600, gitignored)
+# exactly like the WireGuard keys, reused on every build, and replaced only by
+# --rotate-keys. Every build also writes out/snmp_zabbix.env: the same
+# credentials under Zabbix's own macro names, ready to paste into the host or
+# the global macro table. out/ is gitignored. Treat that file exactly like
+# the .rsc files sitting next to it.
+#
+# >>> ROLL OUT IN TWO PASSES, same discipline as bfd and mgmt_refresh:
+# >>>   pass 1: enabled=false -> deploy everywhere. Renders the agent OFF
+# >>>           explicitly and neutralises `public`. Nothing starts listening;
+# >>>           no credential is written into any .rsc.
+# >>>   pass 2: fill in `sources`, enabled=true -> deploy everywhere. Armed.
+# >>> Verify from the POLLER, against ONE router, before the fleet:
+# >>>   snmpwalk -v3 -l authPriv -u zabbix -a SHA -A '<auth>' -x AES -X '<priv>' \
+# >>>            203.0.113.241 1.3.6.1.2.1.1.5.0
+# >>> That must return the router's identity. If it times out the firewall is
+# >>> the suspect; if it says "authentication failure" the credentials are.
+snmp:
+  enabled: true
+
+  # The v3 SECURITY NAME: Zabbix calls the field exactly that. It's not a
+  # community string and carries no authority on its own, so it's safe in a
+  # committed file for the same reason a username is.
+  user:    zabbix
+
+  # sysContact, rendered verbatim. Free text, but it's quoted into the .rsc,
+  # so no " and no \. generate.py refuses anything that would break out of
+  # the quoting and take the rest of the import with it.
+  contact: "noc@example.net"
+  # sysLocation is DERIVED, not listed here: each router reports its own site
+  # code (ord1, ord2, hdc, a remote site's name). One fleet-wide constant would
+  # tell whoever is reading Zabbix the only thing they already knew.
+
+  # WHO MAY POLL. Prefixes, and it's the source address THE ROUTER SEES.
+  # Not the poller's own address, if anything between them NATs.
+  #
+  # v4 only, for the reason mgmt_prefixes is v4 only: the v6 input chains carry
+  # no management hole at all, and a v6 entry here would punch the first one in
+  # a chain whose whole design is that it has none. generate.py rejects one.
+  #
+  # KEEP IT TIGHT. A /32 for the poller is right. The home /25 isn't, and
+  # 0.0.0.0/0 is refused outright. This list is the only thing between an
+  # internet-facing UDP service and everyone who scans for one.
+  sources:
+    - 203.0.113.7/32              # the Zabbix server, as the routers see it
+
+  # SHA1 + AES is the strongest pair MikroTik DOCUMENTS for /snmp/community
+  # (MD5|SHA1, DES|AES). MD5 and DES are refused by generate.py: they are why
+  # SNMPv3 has the reputation it has, and picking either would make lock 2
+  # decorative while still costing the same to operate.
+  #
+  # >>> Newer RouterOS builds accept SHA256/SHA512 and this file renders
+  # >>> whatever you put here. But VERIFY ON A LIVE BOX FIRST. One line,
+  # >>> reversible, doesn't touch anything else:
+  # >>>   /snmp/community/set [find name=zabbix] authentication-protocol=SHA256
+  # >>> If it's refused, leave this at SHA1. A value RouterOS rejects fails
+  # >>> the /import: which is why the whole SNMP block renders LAST in every
+  # >>> .rsc: getting this wrong costs you monitoring, never the router.
+  # >>> Zabbix must be told the SAME pair. Its name for AES is "AES128", which
+  # >>> is what RouterOS means by AES.
+  auth_protocol:       SHA1
+  encryption_protocol: AES
+
+ospf_cost:
+  backbone: 5
+  wan1:     10
+  wan2:     100
+  er_xc:    1
+  # Remote-site tunnels. Deliberately DEARER than the backbone (5), because a
+  # site with a tunnel to every BR is a possible BR<->BR transit path and this
+  # cost is the only thing keeping a consumer uplink out of the inter-BR path
+  # while the backbone is healthy. 20+20 vs 5 means it's only ever chosen when
+  # the backbone is genuinely gone. Which is worth having, not worth
+  # preferring. Same trade the er1<->er2 pair already carries.
+  site:     20
+
+# --- BFD: sub-second liveness UNDERNEATH OSPF -------------------------
+# OSPF hellos are what notice a dead WireGuard tunnel (docs/ospf.md), but the
+# fastest they notice is dead-interval: 20s on wan1/backbone, 40s on wan2. BFD
+# is a dedicated hello protocol that does the same job in milliseconds and hands
+# OSPF the verdict, so the adjacency tears on BFD's clock, not OSPF's.
+#
+# BFD is ADDITIVE. The OSPF hello/dead timers stay exactly as they were, so if a
+# BFD session never establishes the network behaves precisely as it does today.
+#
+# ONE INTERVAL PER LINK CLASS, mirroring ospf_cost, because the classes are
+# physically different media and a timer that's right for a datacenter tunnel
+# will flap a 5G link. detect time = interval x multiplier.
+#
+#   configure:  render the /routing/bfd/configuration entries. INERT ON ITS OWN.
+#               A config entry only PERMITS a session, it never starts one.
+#               RouterOS forbids BFD on anything not listed here, so this must
+#               be true on BOTH ends of a link before a session can ever form.
+#   use_ospf:   put use-bfd=yes on the OSPF interface-templates. THIS is what
+#               actually asks for sessions.
+#
+# >>> ROLL THESE OUT IN TWO PASSES, and in this order. deploy.yml applies one
+# >>> router at a time behind a manual gate, so there's a long window where
+# >>> half the routers have the new config and half don't. If `use_ospf` lands
+# >>> on br1 while er2 still forbids BFD, br1 asks for a session er2 will never
+# >>> answer: and an OSPF adjacency holding a permanently-down BFD session is
+# >>> exactly the flap this feature exists to prevent.
+# >>>   pass 1: configure=true, use_ospf=false  -> deploy everywhere. No-op.
+# >>>   pass 2: use_ospf=true                   -> deploy everywhere. Armed.
+# >>> Verify between passes:  /routing/bfd/session/print
+bfd:
+  configure: true
+  use_ospf:  true        # <- flip to true only after pass 1 is on every router
+
+  # interval is BOTH min-tx and min-rx: both ends of every link run the same
+  # class, so splitting them would only create a way to mismatch them. BFD
+  # negotiates max(local min-tx, remote min-rx) anyway.
+  links:
+    # BR<->BR, datacenter to datacenter. Deliberately NOT 100ms: these are CHR
+    # guests on oversubscribed VPS hosts, and a hypervisor scheduling gap of a
+    # few hundred ms is normal. 600ms still beats the 20s dead-interval by 33x.
+    backbone: { interval: 200ms, multiplier: 3 }   # detect ~600ms  (was 20s)
+    # Residential fibre through WireGuard on a small ER. Stable, but consumer
+    # gear and a consumer uplink. Looser than the backbone on purpose.
+    wan1:     { interval: 300ms, multiplier: 4 }   # detect ~1.2s   (was 20s)
+    # CGNAT'd 5G. The whole reason wan2's OSPF timers are already loose (see
+    # AD-LOG 7.1). Aggressive BFD here would flap the adjacency on ordinary
+    # mobile jitter, which is worse than detecting slowly. 5s vs 40s is still 8x.
+    # 5G: fast in the brochure, philosophical in practice.
+    wan2:     { interval: 1s,    multiplier: 5 }   # detect ~5s     (was 40s)
+    # er1<->er2 over real wired Ethernet in one rack. A pulled cable already
+    # drops carrier and tears OSPF instantly; BFD is here for the case that does
+    # NOT drop carrier: a live-but-not-forwarding sibling, or a switch between
+    # them. This link has no explicit OSPF timers, so it's on the 40s default.
+    er_xc:    { interval: 100ms, multiplier: 3 }   # detect ~300ms  (was 40s)
+    # A remote site's uplink: consumer gear on a consumer line, physically the
+    # same class of link as wan1, so the same timers. Not looser: a site has no
+    # sibling to fail over to, so noticing quickly is the whole value.
+    site:     { interval: 300ms, multiplier: 4 }   # detect ~1.2s   (was 20s)
+
+  # --- ER <-> customer firewall transit segment ------------------------
+  # DELIBERATELY NOT IN `links` ABOVE. Everything in `links` mirrors an
+  # ospf_cost class, and this segment carries no OSPF at all. It's passive
+  # on both instances (a customer must never see the internal topology). The
+  # client asking for a session here is /routing/bgp/connection, not an OSPF
+  # interface-template, so it's a different switch with a different rollout.
+  #
+  # WHAT IT BUYS: today a dead firewall is noticed on the BGP HOLD TIME.
+  # RouterOS's default 3 minutes. For three minutes an ER keeps a VIP pointed
+  # at a box that's gone, and keeps the /25 anchor up on the strength of it.
+  # BFD cuts that to ~900ms. This is the single largest detection gap left in
+  # the network, and it sits on the one segment carrying real customer traffic.
+  #
+  # PRESENT (this block) -> the ERs' transit interface PERMITS BFD with these
+  # timers, replacing the `forbid-bfd=yes` entry. Inert on its own, exactly
+  # like `configure` above: permitting a session never starts one.
+  # ABSENT      -> the forbid entry stands and nothing about BFD changes.
+  # Requires configure: true: these are entries in the same menu.
+  #
+  # 300ms x 3 and NOT the 100ms the er1<->er2 wire runs at, because the far
+  # end isn't a MikroTik. pfSense runs FRR's bfdd as an ordinary userspace
+  # process on a general-purpose OS with a packet filter in front of it; 300ms
+  # is also FRR's own default, so both ends agree without anyone tuning
+  # anything. A firewall doing a lot of work isn't a firewall that's down.
+  customer: { interval: 300ms, multiplier: 3 }   # detect ~900ms (was ~180s)
+
+# --- BGP ECMP ---------------------------------------------------------
+# How many equal next-hops to install for one prefix.
+#
+# It matters most where you would least expect it. An ER hears 0.0.0.0/0 from
+# br1 and from br2, and the two are IDENTICAL: same local-pref, same (empty)
+# AS_PATH, same origin, and the same IGP metric. Both BR loopbacks sit behind
+# the one tun-wan1 interface, so OSPF can't separate them either. Without
+# multipath RouterOS installs ONE of them and breaks the tie on router-id. The
+# network is "multihomed" and every packet leaves through the same BR.
+#
+# Turning it on is also what makes two firewalls claiming the same VIP at equal
+# local_pref actually ECMP, which the firewalls section has always claimed.
+#
+# IT IS A COUNT, NOT A SWITCH.  `/routing/bgp/instance multipath` is typed
+# `num`: "install the specified number of ECMP routes". Set it to how many
+# next-hops you want installed: 2 for two BRs.
+#
+#   2..16     -> multipath=<n>
+#   false     -> not emitted; back to the router-id tie-break
+#   true      -> REFUSED at build time. See below.
+#
+# >>> `multipath=yes` is a TYPE ERROR, and on this deploy path that isn't a
+# >>> harmless one. deploy.yml runs `reset-configuration ... run-after-reset=`,
+# >>> so the import fails on that line AFTER the box has been wiped: every
+# >>> /routing/bgp object below it's never created and the router comes back
+# >>> with no instance, no connections and no sessions. Cost br1 a rebuild
+# >>> once already (AD-LOG 26.1).
+# >>> Ask me how I know. Actually, don't: it's in the AD-LOG, with timestamps.
+#
+# >>> VERIFY BEFORE YOU TURN THIS ON. The property has moved across RouterOS
+# >>> versions, so confirm it on a live box first. One line, reversible,
+# >>> and it doesn't touch the session:
+# >>>     /routing/bgp/instance set [find name=core] multipath=2
+# >>>     /routing/bgp/instance print detail where name=core
+# >>>     /routing/bgp/instance set [find name=core] !multipath
+# >>> If the `set` is refused, leave this false; "no preference" then means a
+# >>> stable router-id tie-break rather than load sharing, and te.local_pref
+# >>> still works exactly as documented.
+#
+# Written to /routing/bgp/instance verbatim, so a version difference is a fix
+# to this one line, not a template change across three.
+bgp_multipath: 2
+
+# --- Origination mode: what keeps a BR announcing the aggregate -------
+# Both modes originate 203.0.113.0/24 (and the v6 aggregate) from the same
+# distance-254 blackhole anchor, toggled by the same anchor-guard script. They
+# differ only in what the guard treats as "I can still deliver":
+#
+#   anchor  ANY active customer prefix. The home /25 or a remote site's /29.
+#           However it's reached, including through a sibling BR over the
+#           backbone. Withdraw after 10 min without one. A BR that loses its
+#           home tunnels KEEPS announcing and forwards home via the backbone.
+#           (docs/origination.md, the original design.)
+#
+#   home    the home /25 (and /48), learned from er1/er2 and reached over one
+#           of THIS BR's OWN tunnels to the ERs. A /25 that resolves through
+#           the backbone doesn't count. Withdraw after 60 s without it.
+#           This is the per-BR drain lever: disable er1's AND er2's tunnels to
+#           br1 and br1 withdraws from its upstream while br2 keeps announcing:
+#               on er1 and er2:  /interface/wireguard/disable [find name~"^wg-br1-"]
+#           It also withdraws a BR automatically when its own WAN can no longer
+#           reach home, which is the provider-side failure anchor mode rides
+#           out on the backbone.
+#           THE TRADE: a home outage longer than 60 s withdraws the aggregate
+#           from EVERY BR, and a live remote site no longer holds it up.
+#           (docs/origination.md#home-mode, AD-LOG §30.)
+#
+# arm_guard  renders the anchor-guard scheduler. FALSE means the guard never
+#            runs and neither mode withdraws anything. `home` included, so
+#            flipping mode alone is inert. Prove the signal first: the steps
+#            are in the comment above the scheduler line in out/br*.rsc.
+origination:
+  mode:      anchor      # anchor | home
+  arm_guard: false
+
+# --- Border Routers ---------------------------------------------------
+# index drives loopback (.240+index) and all derived /31s + ports.
+#
+# TRAFFIC ENGINEERING (optional, per BR, `te:`). Two INDEPENDENT axes:
+#
+#   te.prepend      INGRESS. Extra copies of our own ASN on the aggregate as it
+#                   leaves THIS BR, so the DFZ prefers the other one. A hint,
+#                   not a guarantee: a network whose own local-pref prefers this
+#                   upstream never looks at AS_PATH length.
+#   te.local_pref   EGRESS. The local-pref the ERs and sites stamp on the
+#                   default they hear FROM this BR, so the inside of the AS
+#                   prefers it. Higher wins; RouterOS's own default is 100.
+#
+# Set only `prepend` for ingress-only TE, only `local_pref` for egress-only,
+# both for both, and omit `te:` entirely for plain ECMP multihoming. Nothing
+# requires the two axes to pick the SAME BR. In via br1 and out via br2 is a
+# supported configuration here (docs/traffic-engineering.md explains why).
+#
+# ALL-OR-NOTHING: whichever key you set, set it on EVERY border router,
+# including the losing value on the preferred one (`prepend: 0`,
+# `local_pref: 100`). generate.py refuses a partial set, because a lone
+# `local_pref: 200` only works by pairing your number against a RouterOS
+# default that's written down nowhere in this file.
+#
+#   # br1 primary both ways, br2 a backup:
+#   te: { prepend: 0, local_pref: 200 }    # on br1
+#   te: { prepend: 5, local_pref: 100 }    # on br2
+border_routers:
+  - name:  br1
+    site:  ord1
+    index: 1
+    provider:      vultr
+    wan_address:   198.51.100.57
+    wan_prefix:    25              # example: the gateway must sit inside this subnet
+    wan_gateway:   198.51.100.1
+    static_default: true
+    peer_address:  169.254.169.254
+    peer_asn:      64515
+    bgp_auth_key:  "CHANGE-ME-vultr-md5"   # the TCP-MD5 password your upstream gave you
+    upstream_communities: []
+    te: { prepend: 5, local_pref: 100 }
+    # Vultr: the default route is discovered by Router Advertisement. There's
+    # no static v6 gateway to set. `gateway: ra` makes the template enable RA
+    # acceptance, which a forwarding router does NOT do by default (and which
+    # needs a reboot to take effect. See ansible/README.md).
+    #
+    # !! THE ADDRESS BELOW IS NOT ARBITRARY. DO NOT "TIDY" IT TO ::1.
+    # !!
+    # !! We own the whole /64 and can USE any address in it, but Vultr will only
+    # !! establish BGP with the address assigned to the INSTANCE. Peer from
+    # !! anything else and their side silently drops our SYN: no RST, no ICMP
+    # !! unreachable, nothing in the BGP log, session simply never appears.
+    # !! (Diagnosed 2026-07-21: we were peering from 2001:db8:f000:4126::1,
+    # !! which looked tidier and cost half a day. Vultr was meanwhile trying to
+    # !! connect INBOUND to the address below, which is how it was found.
+    # !! /ipv6/firewall/connection print where src-address~"19f0:ffff".)
+    # !! Half a day, for the vanity of a ::1. Nunca más.
+    # !!
+    # !! It's also EUI-64, derived from ether1's MAC (56:00:06:12:34:56 ->
+    # !! 5400:6ff:fe12:3456). So it's MACHINE-SPECIFIC: rebuild the instance
+    # !! and this value changes. If that ever happens, get the new one from the
+    # !! Vultr panel, or on the router read the dynamic global address SLAAC
+    # !! derives from the same RA:
+    # !!     /ipv6/address print where interface=ether1
+    # !! and take the entry flagged DG (dynamic, global). That's the address
+    # !! Vultr expects. Update it here and redeploy; nothing else needs to move.
+    wan_v6:
+      address:  2001:db8:f000:4126:5400:6ff:fe12:3456
+      prefix:   64
+      gateway:  ra
+    peer_v6_address: 2001:19f0:ffff::1
+
+  - name:  br2
+    site:  ord2
+    index: 2
+    provider:      hosthatch
+    wan_address:   198.51.100.200
+    wan_prefix:    25              # example: the gateway must sit inside this subnet
+    wan_gateway:   198.51.100.129
+    static_default: true
+    peer_address:  169.254.169.254
+    peer_asn:      65473
+    bgp_auth_key:  "CHANGE-ME-hosthatch-md5"   # the TCP-MD5 password your upstream gave you
+    upstream_communities:
+      # MANDATORY. Without it HostHatch's DDoS scrubbing platform doesn't
+      # propagate the announcement at all. Their schema, not ours.
+      # Announce all you like without it; you're just talking to yourself.
+      - "65500:10000"
+    te: { prepend: 0, local_pref: 200 }
+    # HostHatch: a delegated /64 (any address in it's ours to use) and a
+    # FIXED link-local gateway. fe80::1 must be interface-scoped (fe80::1%ether1)
+    # in the route, or RouterOS can't resolve it; the template does that.
+    wan_v6:
+      # HostHatch will only peer with the ::179 address out of the /64.
+      address:  2001:db8:f001:a595::179
+      prefix:   64
+      gateway:  fe80::1
+    peer_v6_address: 2605:4840:ffff::179
+
+  # - name: br3
+  #   site: <site>
+  #   index: 3
+  #   ...
+
+# --- Edge Routers -----------------------------------------------------
+# index drives loopback (.248+index).
+edge_routers:
+  - name:  er1
+    site:  hdc
+    index: 1
+    wans:
+      - id: wan1
+        interface: ether1
+        address:   172.20.101.11/24
+        gateway:   172.20.101.1
+      - id: wan2
+        interface: ether2
+        address:   172.20.102.11/24
+        gateway:   172.20.102.1
+    xc_interface:      ether3      # ER <-> ER interconnect
+    transit_interface: ether4      # -> pfSense
+
+  - name:  er2
+    site:  hdc
+    index: 2
+    wans:
+      - id: wan1
+        interface: ether1
+        address:   172.20.101.12/24
+        gateway:   172.20.101.1
+      - id: wan2
+        interface: ether2
+        address:   172.20.102.12/24
+        gateway:   172.20.102.1
+    xc_interface:      ether3
+    transit_interface: ether4
+
+# --- home local links (203.0.113.224/28) ----------------------------
+# No VRRP: the firewall(s) reach both ERs directly over the transit /29 and
+# ECMP their egress default across er1/er2 (advertised by BGP, see `firewalls`).
+home:
+  xc_net:        203.0.113.224/31   # er1 = .224, er2 = .225
+  transit_net:   203.0.113.232/29
+  transit_er1:   203.0.113.233
+  transit_er2:   203.0.113.234
+  # v6 counterparts. The transit segment is a real /64 because it's a shared
+  # L2 domain with multiple firewalls on it. NOT a P2P link. The ER<->ER
+  # interconnect is a /127, which is.
+  xc_net_v6:      2001:DB8:0:40::/127   # er1 = ::0, er2 = ::1
+  transit_net_v6: 2001:DB8:0:41::/64
+  transit_er1_v6: 2001:DB8:0:41::1
+  transit_er2_v6: 2001:DB8:0:41::2
+
+# --- customer firewalls (eBGP, private ASN) ---------------------------
+# Firewalls/routers at hdc that CLAIM VIPs out of the /25 by advertising
+# more-specifics to BOTH ERs. They are eBGP customers: NOT in AS64500, never
+# in the iBGP mesh, no WireGuard (they peer over the local L2 transit segment).
+# The ER's inbound filter is the security boundary: a firewall gets exactly what
+# is granted here and nothing else. Two ways to grant, usable together:
+#   allowed_vips: exact prefixes, enumerated. This prefix at this length, period.
+#   delegations:  a block (prefix + max_len) the firewall may carve up as it
+#                 likes: it may advertise the block itself or any more-specific
+#                 down to max_len (default 32) without a re-render here.
+# Both compile to the same thing: a prefix plus an accepted dst-len range.
+#
+# This eBGP session is now the ONLY reachability + health signal for the /25:
+#   - inbound: a firewall's live VIP advertisement is what makes the ER originate
+#     the /25 aggregate (see the home-anchor guard in er.rsc.j2). Session/route
+#     down == that VIP is gone. Real health, not a ping.
+#   - ECMP: two firewalls advertising the SAME vip at equal preference are
+#     load-balanced by the ERs. Leave local_pref UNSET for ECMP; set distinct
+#     local_pref only when you want deterministic primary/backup instead.
+#   - egress: the ERs advertise a default back to the firewall, so it ECMPs its
+#     outbound across er1/er2 (replaces the old VRRP default gateway).
+# A second firewall (fwb) advertising 203.0.113.1/32 at equal preference is all
+# it takes to turn on inbound ECMP. Add it here, nothing else changes.
+#
+# `bfd: true` PER FIREWALL puts use-bfd=yes on that firewall's two eBGP
+# connections (v4 and v6), so the ER drops the session. And the VIP with it.
+# On BFD's clock (~900ms, see bfd.customer) instead of the 3-minute BGP hold
+# time. It's per firewall and not global ON PURPOSE: the far end is a box this
+# AS doesn't administer, and RouterOS's behaviour when a BGP connection asks
+# for BFD that the far end never answers isn't something this network has
+# tested. Flag ONE firewall, watch it, then flag the next. The other firewall
+# keeps carrying the VIP the whole time.
+#
+# >>> ORDER: enable BFD on the FIREWALL first, then flag it here and deploy.
+# >>>   1. bfd.customer present + configure: true, deployed to both ERs. The
+# >>>      transit interface now permits BFD. Nothing has changed on the wire.
+# >>>   2. on the firewall: enable bfdd and attach it to ONE ER neighbour.
+# >>>      pfSense: System -> Package Manager -> FRR, Services -> FRR -> BFD,
+# >>>      then tick BFD on that BGP neighbour. 300ms/300ms/3 is FRR's default.
+# >>>      Confirm the session is still up before doing the second ER: whether
+# >>>      FRR holds BGP down while a configured BFD has never come up isn't
+# >>>      verified here, and one at a time leaves the other ER carrying it.
+# >>>   3. bfd: true here -> ./build.sh -> deploy the ERs one at a time.
+# >>> Verify on the ER, after each step:
+# >>>     /routing/bfd/session/print
+# >>>     /routing/bgp/session/print where remote.address=<the firewall>
+#
+# >>> VERIFY `use-bfd` ON A LIVE BOX BEFORE THE FIRST DEPLOY. The property has
+# >>> moved across RouterOS versions, and deploy.yml imports AFTER a
+# >>> reset-configuration: a rejected line leaves the ER with no BGP below it
+# >>> (AD-LOG 26.1). One line, reversible, doesn't touch the session:
+# >>>     /routing/bgp/connection set [find name=cust-fwa] use-bfd=yes
+# >>>     /routing/bgp/connection print detail where name=cust-fwa
+# >>>     /routing/bgp/connection set [find name=cust-fwa] !use-bfd
+firewalls:
+#
+# The v6 grants use the SAME two shapes with the same meaning. The only
+# real difference: a v6 delegation's max_len defaults to 64 and may not
+# exceed it, because a v6 LAN is a /64 and SLAAC breaks on anything longer. A
+# firewall that wants a single service address advertises a /128 via
+# allowed_vips_v6: so between the two shapes every legitimate case is covered
+# and nothing else is.
+  - name:          fwa
+    asn:           65010                 # private; must not be 64500/64515/65473
+    peer_address:  203.0.113.236       # on the transit /29, L2 with both ERs
+    peer_address_v6: 2001:DB8:0:41::10  # on the transit /64, same L2
+    # Sub-second VIP failover. Flip to true only once FRR's bfdd is enabled on
+    # this box and pointed at both ERs. See the order above.
+    bfd:           true
+    delegations:
+      - prefix:  203.0.113.0/28
+        max_len: 32
+    delegations_v6:
+      - prefix:  2001:DB8:1:100::/56    # 256 /64 LANs to carve up
+        max_len: 64
+      - prefix:  2001:DB8:1:200::/56
+        max_len: 64
+
+  - name:          fwb
+    asn:           65011                 # private; must not be 64500/64515/65473
+    peer_address:  203.0.113.237       # on the transit /29, L2 with both ERs
+    peer_address_v6: 2001:DB8:0:41::11  # on the transit /64, same L2
+    # Flag the SECOND firewall only after the first one has been up on BFD long
+    # enough to trust it. Both advertise the same VIPs, so an unflagged fwb is
+    # the fallback while fwa is the experiment.
+    bfd:           true
+    delegations:
+      - prefix:  203.0.113.0/28
+        max_len: 32
+    delegations_v6:
+      - prefix:  2001:DB8:1:100::/56    # 256 /64 LANs to carve up
+        max_len: 64
+      - prefix:  2001:DB8:1:200::/56
+        max_len: 64
+  
+  - name:          ucg
+    asn:           65064
+    # OPTIONAL, and absent on fwa/fwb above deliberately. A firewall without
+    # it's an ordinary customer whose own config someone else writes.
+    #
+    # Setting it makes the build render the CUSTOMER's half of these sessions
+    # too, from the same grant below that builds the ER's cust-in filter. One
+    # grant, two ends, rebuilt together: the failure this removes isn't a
+    # broken session but a working one carrying less than it should. A VIP
+    # granted here and never advertised, or a LAN advertised into a filter
+    # that drops it. Both read as "BGP is up" from either end.
+    #
+    #   unifi    -> out/ucg.unifi.conf, FRR format. UniFi's BGP IS FRR; the
+    #               file is uploaded at Settings -> Routing -> BGP.
+    #   pfsense  -> recognised, no renderer yet. The build says so and writes
+    #               nothing rather than failing the whole render.
+    #
+    # A `type:` whose renderer exists but emits no BFD stanza REFUSES
+    # `bfd: true`: that's unifi today. The ER would ask for a session the
+    # generated far end was never told to answer, and the whole point of
+    # rendering both ends from one grant is that they can't disagree. A
+    # `pfsense` peer has no renderer, so its config is the operator's and the
+    # flag is theirs to match.
+    #
+    # The generated file is the one output in out/ that holds no keys, so it
+    # is the one you can hand to whoever runs the box.
+    type:          unifi
+    # Who owns the gateway's default route. `install` (the default): FRR
+    # installs the ERs' default, ECMP across both. `ignore`: the default is
+    # refused inbound and the UniFi WAN manager owns egress, with the transit
+    # set up as one more WAN (gateway = er1's transit address) next to Comcast
+    # and Verizon. On UniFi `install` makes the other WANs go idle. FRR's
+    # default lands in the kernel ahead of the WAN manager's per-WAN routes.
+    default_route: install
+    peer_address:  203.0.113.235
+    peer_address_v6: 2001:DB8:0:41::64
+    allowed_vips:
+      - 203.0.113.17/32
+    delegations_v6:
+      - prefix: 2001:DB8:1:200::/56
+        max_len: 64
+  
+# --- remote sites (none yet) ------------------------------------------
+# A remote site is ONE MikroTik router (hAP-class) doing alone what er1+er2 do
+# as a pair at hdc: a WireGuard tunnel to EVERY BR, membership of the full iBGP
+# mesh, and OSPF cost deciding the path. There's NO primary_br/backup_br.
+# Pinning a site to one BR would make its mesh strictly weaker than an ER's and
+# buy nothing. The device is also the site's WAN router: the /29 is attached to
+# it, it holds the first address as the inside default gateway, and inside
+# traffic is routed directly with no NAT and no eBGP customer session.
+#
+# EVERYTHING BELOW `index` IS DERIVED. Delegation, /48, loopbacks, tunnel
+# /31s, WireGuard ports, keys. Don't list them here. index is a fixed slot:
+# allocated sequentially, NEVER reused, and a decommissioned site's index stays
+# burned (stale route objects and third-party filters outlive your topology).
+# Indexes are tattoos, not stickers.
+#
+# >>> THE V4 BUDGET IS FOUR SITES, and it's not soft. blocks.site_p2p is a /28
+# >>> = 8 /31s, and each site reserves one per BR (2 today). generate.py refuses
+# >>> to render past that rather than renumbering live links; the error names
+# >>> the options. A THIRD BORDER ROUTER overflows it. See build().
+#
+# ADDING ONE:
+#   1. append the entry, pick the next free index, run ./build.sh
+#   2. read the diff on the BRs and ERs before deploying anything: they each
+#      gain one tunnel/session and nothing else
+#   3. the FIRST apply has to happen at the site (console or LAN). ansible
+#      reaches a site over its loopback, which doesn't exist until the tunnels
+#      do. After that it's an ordinary inventory host.
+sites: []
+#  - name:  sfo            # site code: 3-4 chars, no geography implied.
+#    index: 1              # sequential, never reused. Drives everything.
+#    router: sr1           # optional; fqdn is {router}.{name}, default sr1
+#    wans:
+#      - id: wan1
+#        interface: ether1
+#        # address/gateway TOGETHER for a static ISP, or BOTH absent for a
+#        # dhcp-client. One without the other is refused.
+#        # address: 203.0.113.10/29
+#        # gateway: 203.0.113.9
+#    lan_interfaces: [ether2, ether3, ether4, ether5]
+
+# =====================================================================
+#  EXTERNAL PEERING: three realms, one construct
+# =====================================================================
+# A peer is a THIRD PARTY. Not a member of AS64500, not in the iBGP mesh,
+# not in OSPF, and deliberately NOT in the `tunnels` interface list. That
+# list is a full-trust grant (br.rsc.j2 accepts everything arriving on it).
+# A peer terminates on a BORDER ROUTER only: an ER has no public address to
+# be dialled at, and a peer tunnel there would put a stranger inside the
+# home input chain.
+#
+# THE REALM DECIDES WHERE THE ROUTES LAND. That's the only thing that
+# really differs between the three, and it's the whole design:
+#
+#   internet  the main table, via the existing `core` instance. Real traffic
+#             follows these routes. Settlement-free: we announce our own
+#             aggregates, we accept that peer's cone, and we never re-announce
+#             one peer to another or to an upstream.
+#   3p        the SAME exchange (our real ASN, our real aggregates, their
+#             real prefixes) landed in its OWN table. A 3p peer can't
+#             influence how this AS forwards a production packet, because
+#             production never consults that table. Announcements carry
+#             NO_EXPORT by default.
+#   dn42      the DN42 overlay: its own ASN, its own space, its own table.
+#             (DN42: the internet, but everybody is breaking it on purpose.)
+#
+# NOTHING INSIDE AS64500 REACHES THE VRF TABLES YET, and that's deliberate.
+# Sessions and routes first; whether home traffic ever gets in is a separate
+# decision with its own blast radius.
+#
+# WE CAN NEVER BECOME TRANSIT, and it's structural rather than remembered:
+# every peer-out chain ends in a terminal reject, the same shape as the
+# `ebgp-out` chain that already protects the upstreams today.
+# Nobody wants to be the next route-leak post-mortem with their ASN in the
+# title. Least of all a network that lives in a closet.
+#
+# EVERYTHING ABOUT OUR SIDE IS DERIVED. Everything about THEIR side is
+# declared, because it can't be derived from anything we own. That split is
+# the whole schema: and a declared value we could have derived is REFUSED,
+# not quietly honoured:
+#   DERIVED  interface name (ext-<name>), listen port (52100+slot), our
+#            private key, the PSK, the MD5 key, our half of any /127 we
+#            number, every filter-chain name, the session name, the instance.
+#   DECLARED name, index, realm, routers, asn, transport, their endpoint and
+#            port, their WireGuard public key, their link addresses when they
+#            number the link, their cone, and the per-family route limits.
+peers: []
+#  - name:      globex          # OUR token for them. 2-12 chars of [a-z0-9-].
+#                             # It IS the interface name, the chain names, the
+#                             # session name and half the keystore identity.
+#                             # A rename is a renumber; pick it once.
+#    index:     1             # FIXED SLOT, sequential, NEVER reused. Drives
+#                             # the listen port and the /127 offset. A retired
+#                             # peer's index stays burned. Their tunnel
+#                             # config and their filters outlive your topology.
+#    realm:     internet      # internet | 3p | dn42
+#    routers:   [br1]         # A LIST. A second session from the other BR is
+#                             # a data change, not a redesign.
+#    asn:       64510
+#    transport: wireguard     # wireguard | gre | gre6
+#    contact:   "noc@example.net  # AS64510"    # comment only, never parsed
+#
+#    # --- THEIR side ---------------------------------------------------
+#    remote:
+#      endpoint:      192.0.2.94  # outer dst. gre6: a v6 address.
+#      endpoint_port: 51820           # wireguard only
+#      public_key:    "REPLACE-ME="   # wireguard only. Theirs. Not a secret.
+#      # Link addressing. Set only what THEY assign.
+#      #
+#      # >>> THERE IS NO v4 HERE TO GIVE. `blocks:` allocates all 256
+#      # >>> addresses of 203.0.113.0/24 (every one of them) so a v4
+#      # >>> peering link is PEER-SUPPLIED or absent. Omitting it's not a
+#      # >>> degraded session: a v6-only session is a complete session, and
+#      # >>> "we number v6, you number v4 if you want v4" is an honest
+#      # >>> peering position for a network with a full /24.
+#      # address: 198.51.100.5        # their end of the v4 link
+#      # local:   198.51.100.4        # ours, from THEIR block
+#      #
+#      # v6: omit BOTH and we number the /127 out of blocks_v6.peer_p2p.
+#      # Give both and we use theirs. An fe80:: address means link-local
+#      # (DN42's convention) and nothing is numbered at all.
+#      # address_v6: 2001:db8:1::1
+#      # local_v6:   2001:db8:1::2
+#
+#    # --- what we ACCEPT -------------------------------------------------
+#    import:
+#      # Their cone: a prefix plus the longest length we will take. max_len
+#      # defaults to the DFZ ceiling for the family (24 for v4, 48 for v6).
+#      # anything longer isn't a route the rest of the internet carries
+#      # either, so accepting it costs table and buys nothing.
+#      prefixes:
+#        - { prefix: 192.0.2.0/24, max_len: 24 }
+#        - { prefix: "3fff:100::/29", max_len: 48 }
+#      # REQUIRED, per family, and deliberately NOT derived. For a customer,
+#      # capacity arithmetic gives a real bound because we delegated the
+#      # block. For a peer it doesn't: a /29 accepted to /48 has a worst case
+#      # of 2^20 routes, which is a formality and not a limit. How many
+#      # prefixes a peer actually sends is an operational fact they tell you.
+#      max_routes:    50
+#      max_routes_v6: 50
+#
+#    # --- secrets: BOOLEANS. The values live in keys.json. ----------------
+#    # topology.yml's header says it holds no secrets. `bgp_auth_key` above
+#    # already breaks that promise, in a COMMITTED file, and it's not a
+#    # precedent to copy. Setting these true generates the value into
+#    # keys.json (gitignored, mode 600); it reaches the far end via
+#    # `generate.py --show-peer-secrets <name>`, so an ordinary build never
+#    # puts a third party's session key on stdout or in a CI log.
+#    psk: false               # wireguard preshared-key. Not every stack has one.
+#    md5: false               # tcp-md5-key on the BGP session.
+#
+#  # A 3p peer adds two keys:
+#  - name:      acme
+#    index:     2
+#    realm:     3p
+#    routers:   [br1]
+#    asn:       64501
+#    isolated:  false         # true -> its OWN vrf 3p-acme instead of the
+#                             # shared `3p` table. Costs a VRF, an instance and
+#                             # a loopback; buys "cannot reach another 3p peer"
+#                             # as a property of the table rather than of a
+#                             # filter someone has to keep correct.
+#    no_export: true          # DEFAULT. Tags our aggregates NO_EXPORT on the
+#                             # way out, so a bilateral interconnect stays
+#                             # bilateral. Set false only when this peer SHOULD
+#                             # propagate us onward.
+
+# --- 3p: bilateral interconnects, in their own table -------------------
+# enabled IS THE MASTER SWITCH. False renders not one line of 3p config.
+3p:
+  enabled: false
+  vrf:     3p            # the SHARED table. `isolated: true` peers get 3p-<name>.
+  # router-id is DERIVED: the BR's own loopback. A BGP router-id is a 32-bit
+  # identifier, not an address: it doesn't need to be reachable from inside
+  # the VRF, and reusing the real one keeps a session traceable to a real box.
+
+# --- DN42: the decentralized overlay -----------------------------------
+# NOTHING BELOW IS REGISTERED YET. Every value is REPLACE-ME until the DN42
+# registry objects exist, and generate.py refuses `enabled: true` with a
+# placeholder in any of them. The same treatment `automation.keys` gets, for
+# the same reason: a value only the future operator can supply must not be
+# guessable by this file.
+#
+# Registration is one application and it's ORDERED: maintainer object, then
+# person, then the ASN, then the IPv4 block and the /48, then the ROAs. All of
+# it's signed git PRs against the DN42 registry. Not this repo.
+#
+# !! THE VRF IS NOT TIDINESS, AND IT IS NOT NEGOTIABLE.
+# !!
+# !! DN42's 172.20.0.0/14 CONTAINS THIS AS'S OWN ER WAN ADDRESSING:
+# !! er1 sits on 172.20.101.11 and 172.20.102.11, er2 on .12 (see
+# !! `edge_routers:` above). A DN42 route covering that space in the MAIN
+# !! table would shadow the ERs' own WAN next-hops. They would stop being
+# !! able to reach their own ISP gateways, over a tunnel that only exists
+# !! because those gateways work. There's no supported way to leak between
+# !! this table and main, and generate.py refuses a `leak:` key by name.
+# !!
+# !! Ojo: this is the one place where "it's just a lab" takes your real
+# !! internet down with it.
+dn42:
+  enabled:   false
+  asn:       REPLACE-ME      # REGISTER FIRST. 4242420000-4242429999.
+  vrf:       dn42
+  prefix:    REPLACE-ME      # our registered DN42 IPv4, inside 172.20.0.0/14
+  prefix_v6: REPLACE-ME      # our registered /48, inside fd00::/8
+  # DERIVED: loopbacks (the .1 of each prefix), the anchor routes, the
+  # instance name, the router-id, and the peering /127s.
+  # rpki:
+  #   # The DN42 ROA cache lives INSIDE DN42, so this group sits in the dn42
+  #   # VRF and is unreachable until DN42 routing is up. That bootstrap cycle
+  #   # is exactly why the import chains reject `invalid` ONLY. See `rpki:`.
+  #   address: REPLACE-ME
+  #   port:    8282
+
+# --- RPKI over RTR ------------------------------------------------------
+# Absent -> no /routing/rpki, no rpki-verify anywhere, byte-identical config.
+#
+# THE CHAINS REJECT `invalid` AND NOTHING ELSE. `unknown` is always accepted.
+# A cache that's down, still loading, or unreachable returns `unknown` for
+# every prefix: so rejecting it would turn a validator outage into a total
+# import outage, on the one box whose job is to have transit. Fail-open is the
+# correct reading of RFC 6811, not a compromise.
+# A validator outage should be a bad day for the validator, not for you.
+#
+# >>> THE CACHE MUST NOT BE REACHABLE ONLY THROUGH A PEER. A route to the
+# >>> validator that resolves through a session the validator is validating is
+# >>> the same recursion the WireGuard endpoint pins exist to prevent.
+# rpki:
+#   internet:
+#     address: REPLACE-ME
+#     port:    3323

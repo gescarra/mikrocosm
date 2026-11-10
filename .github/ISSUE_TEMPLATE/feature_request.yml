@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest a new capability or a change to the topology schema.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the generator can't do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: How it might look in topology.yml. What gets derived and what gets declared?
+  - type: textarea
+    id: failure
+    attributes:
+      label: Failure modes
+      description: What could go wrong on a live router and how validation could catch it at build time.

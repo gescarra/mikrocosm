@@ -1,0 +1,444 @@
+# =====================================================================
+#  deploy.yml. Roll the generated RouterOS config onto each router by way
+#  of the documented reset-and-restore flow (README.md "Applying a config"):
+#
+#      scp out/<fqdn>.rsc  ->  router
+#      /system/reset-configuration <flags> run-after-reset=<fqdn>.rsc
+#
+#  One host at a time, in inventory order (br1 -> er1 -> br2 -> er2), with a
+#  manual confirmation gate before each. The router reboots and drops the link
+#  on every step; we wait for SSH to go DOWN (proof the reset took) then come
+#  BACK (proof the script re-created SSH), then confirm the identity.
+#
+#  Every router we actually apply config to then gets a SECOND reboot. The reset
+#  restores the IPv6 RA setting to its factory default and reboots; our .rsc then
+#  changes that setting, and RouterOS doesn't apply it until the NEXT reboot.
+#  Skipped (unchanged) devices are never touched and never rebooted. See the
+#  "SECOND REBOOT" block below.
+#
+#  IDEMPOTENCE (Terraform-state style): after a verified deploy we stash a
+#  fingerprint of the applied config on the device (<fqdn>.applied). On the next
+#  run we compare the freshly generated config to that fingerprint and SKIP the
+#  device (no reboot) if they match. See README.md "Skipping unchanged devices".
+#
+#  >>> READ ansible/README.md FIRST. This flow can lock you out of a box that
+#  >>> is then reachable ONLY via provider console/VNC. Have that console open.
+#  >>> Not "know where it is". Open. Logged in. Coffee within reach.
+#
+#  Usage:
+#    ansible-playbook deploy.yml                       # deploy only what changed
+#    ansible-playbook deploy.yml --check               # dry run (no changes)
+#    ansible-playbook deploy.yml -e gate=auto          # no prompts (CI only)
+#    ansible-playbook deploy.yml -e force=true         # redeploy even if unchanged
+#    ansible-playbook deploy.yml -e skip=er1.hdc,br2.ord2   # skip named routers
+#    ansible-playbook deploy.yml --limit br2.ord2,er2.hdc   # only these routers
+# =====================================================================
+- name: Roll out RouterOS config via reset-and-restore
+  hosts: routers
+  gather_facts: false
+  connection: local
+  serial: 1            # one router at a time
+  order: inventory     # keep the deliberate br1 -> er1 -> br2 -> er2 order
+  any_errors_fatal: true
+
+  vars:
+    force: false       # -e force=true    -> deploy even if unchanged
+    skip: ""           # -e skip=a,b      -> skip these routers entirely
+    # gate: manual|auto comes from group_vars/all.yml. See the GATE task below.
+    skip_list: "{{ (skip | string).split(',') | map('trim') | reject('equalto', '') | list }}"
+
+    rsc_path: "{{ out_dir }}/{{ inventory_hostname }}.rsc"
+    rsc_name: "{{ inventory_hostname }}.rsc"
+    marker_name: "{{ inventory_hostname }}.applied"                 # fingerprint stashed on the device
+    marker_fetch: "{{ tmp_dir }}/{{ inventory_hostname }}.applied.remote"
+    marker_write: "{{ tmp_dir }}/{{ inventory_hostname }}.applied.new"
+    tmp_dir: "{{ lookup('ansible.builtin.env', 'TMPDIR') | default('/tmp', true) | regex_replace('/$', '') }}"
+    ssh_base: "{{ ['ssh', '-p', ssh_port | string] + ros_ssh_opts + [router_user ~ '@' ~ router_address] }}"
+
+  tasks:
+    # ---- MANUAL SKIP -------------------------------------------------
+    - name: "Skip | router named in 'skip' var — do nothing"
+      ansible.builtin.debug:
+        msg: "SKIP {{ inventory_hostname }} — excluded by skip='{{ skip }}'."
+      when: inventory_hostname in skip_list
+
+    - name: "Skip | end play for manually-skipped router"
+      ansible.builtin.meta: end_host
+      when: inventory_hostname in skip_list
+
+    # ---- PREFLIGHT ---------------------------------------------------
+    - name: "Preflight | generated config exists locally"
+      ansible.builtin.stat:
+        path: "{{ rsc_path }}"
+        checksum_algorithm: sha256
+      register: rsc_stat
+
+    - name: "Preflight | fail early if the .rsc is missing"
+      ansible.builtin.assert:
+        that: rsc_stat.stat.exists
+        fail_msg: "{{ rsc_path }} not found — run ./build.sh at the repo root first."
+        success_msg: "{{ rsc_name }} present ({{ rsc_stat.stat.size | default(0) }} bytes)"
+
+    # ---- NO HOST VARIABLES IN `name:`. EVER. -------------------------
+    # A task's name is templated ONCE, by the first host that actually reaches
+    # the task, and the rendered string is then reused as the banner for every
+    # later host. It doesn't re-render per host, and `serial: 1` doesn't save
+    # you: the cache outlives the batch.
+    #
+    # This is worse than it sounds, because the freeze point is the first host
+    # to REACH the task, not the first host in the play. A run where br1 is
+    # UNCHANGED and ends early froze "Preflight" on br1.ord1 and the GATE/Upload/
+    # Done banners on er1.hdc. So the output confidently announced it was
+    # deploying er1 while it reset br2. Purely cosmetic (every argv, prompt body
+    # and msg below is templated per host at runtime, and the `ok: [host]` on the
+    # result line is always right) but it's a rollout playbook that reboots
+    # routers one at a time, and the banner is what you read before pressing
+    # ENTER at the gate. Put the identity in `msg:`/`prompt:`, never in `name:`.
+    - name: "Preflight | router answers SSH right now"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: started
+        timeout: 15
+      check_mode: false
+      # Times out here? You are almost certainly not sourcing from a prefix in
+      # mgmt_prefixes (today 203.0.113.0/24); SSH and winbox are bound to that
+      # list in both templates. On an ER this is NOT the cause. Those are
+      # reached on their transit addresses, which the input chain accepts by
+      # interface regardless of source (see inventory.yml).
+
+    # ---- CHANGE DETECTION (the "state" comparison) -------------------
+    - name: "Diff | fetch the last-applied fingerprint from the device"
+      ansible.builtin.command:
+        argv: "{{ ['scp', '-O', '-P', ssh_port | string] + ros_ssh_opts + [router_user ~ '@' ~ router_address ~ ':' ~ marker_name, marker_fetch] }}"
+      register: marker_fetch_cmd
+      changed_when: false
+      failed_when: false     # missing marker (never deployed by this tool) is fine
+      # `command` is SKIPPED in check mode by default, and a skipped task leaves
+      # no `rc` for the tasks below to read. So --check would fail on an
+      # undefined attribute rather than printing a plan. This task only reads,
+      # so it's safe to run either way, which is exactly what check_mode:false
+      # is for.
+      check_mode: false
+
+    - name: "Diff | read the fetched fingerprint"
+      ansible.builtin.slurp:
+        src: "{{ marker_fetch }}"
+      register: marker_slurp
+      when: marker_fetch_cmd.rc == 0
+
+    - name: "Diff | compare freshly generated config against the fingerprint"
+      ansible.builtin.set_fact:
+        applied_fp: "{{ (marker_slurp.content | b64decode | trim) if (marker_fetch_cmd.rc == 0) else '' }}"
+        local_fp: "{{ rsc_stat.stat.checksum }}"
+
+    - name: "Diff | decide"
+      ansible.builtin.set_fact:
+        config_changed: "{{ applied_fp != local_fp }}"
+
+    - name: "Diff | status"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'CHANGED — will deploy' if config_changed | bool
+             else ('UNCHANGED — will force-deploy (force=true)' if force | bool
+                   else 'UNCHANGED — skipping (no reboot)') }}
+          {{ '[no prior fingerprint on device]' if applied_fp == '' else '' }}
+
+    - name: "Diff | skip unchanged device — no reboot"
+      ansible.builtin.meta: end_host
+      when: not (config_changed | bool) and not (force | bool)
+
+    # ---- --check STOPS HERE, having answered the only question it was asked.
+    # Everything above reads; everything below resets a router. A dry run that
+    # walked into the second half would be relying on every remaining task
+    # correctly declining to act, and `wait_for state=stopped` would sit there
+    # waiting for a reboot that's never going to happen.
+    #
+    # This is what the pipeline's `plan` job prints on a merge request: which
+    # routers this change would reset, and which it would leave alone. "Changes
+    # the OSPF cost on wan2" and "resets all four routers" are very different
+    # merge requests, and the diff alone doesn't tell them apart.
+    - name: "Plan | --check: report and stop before anything destructive"
+      ansible.builtin.debug:
+        msg: >-
+          PLAN {{ inventory_hostname }} ({{ router_address }}):
+          {{ 'WOULD BE RESET and reloaded — config changed'
+             if config_changed | bool else
+             'unchanged, would be left alone' }}
+      when: ansible_check_mode
+
+    - name: "Plan | end here in check mode"
+      ansible.builtin.meta: end_host
+      when: ansible_check_mode
+
+    # Identity lives in the prompt body below, which IS templated per host.
+    # ---- MANUAL CONFIRMATION GATE ------------------------------------
+    # `gate: manual` (the default) stops here for a human. `gate: auto` skips
+    # the prompt, which is the only thing that works in a pipeline. There's
+    # nobody to press ENTER, and a `pause:` in CI hangs until the job times out.
+    #
+    # The default stays MANUAL deliberately. Automation has to be ASKED for:
+    # -e gate=auto is a flag somebody chose, whereas a default of auto would
+    # mean the safe behaviour depends on remembering to request it.
+    #
+    # WHAT REPLACES THE HUMAN. Nothing here does. The gate moves rather than
+    # disappearing. In CI the confirmation is verify.yml running against the
+    # PREVIOUS router, as a `needs:` edge in the pipeline DAG, so router N+1's
+    # job isn't eligible to start until router N passed its functional tests.
+    # That's a stricter gate than the prompt was: the prompt only ever asked
+    # whether you had looked.
+    - name: "GATE | automatic — the previous router's tests are the gate"
+      ansible.builtin.debug:
+        msg: >-
+          DEPLOY {{ inventory_hostname }} ({{ router_address }}) —
+          {{ 'config CHANGED' if config_changed | bool else 'UNCHANGED, forced' }}.
+          Unattended (gate=auto). This router is only being touched because
+          every check on the previous one passed.
+      when: gate == "auto"
+
+    - name: "GATE | confirm before deploying this router"
+      when: gate != "auto"
+      ansible.builtin.pause:
+        prompt: |
+
+          ============================================================
+           DEPLOY  {{ inventory_hostname }}  ({{ router_address }})
+           {{ 'config CHANGED since last apply' if config_changed | bool else 'UNCHANGED — forced by force=true' }}
+          ============================================================
+          Will upload {{ rsc_name }} and run on the router:
+
+            /system/reset-configuration {{ reset_flags }} \
+                run-after-reset={{ rsc_name }}
+
+          The router WILL reboot and drop connectivity. If the generated
+          script errors partway, this box is reachable ONLY via provider
+          console/VNC until fixed — not over SSH.
+
+          Make sure the PREVIOUS device fully recovered first.
+
+          ENTER = proceed   |   Ctrl-C then A = abort the whole rollout
+          ============================================================
+
+    - name: "Upload | scp the generated .rsc to the router"
+      ansible.builtin.command:
+        argv: "{{ ['scp', '-O', '-P', ssh_port | string] + ros_ssh_opts + [rsc_path, router_user ~ '@' ~ router_address ~ ':' ~ rsc_name] }}"
+      changed_when: true
+
+    - name: "Upload | verify the file landed on the router"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put [/file/get [/file/find name=\"' ~ rsc_name ~ '\"] size]'] }}"
+      register: remote_file
+      changed_when: false
+      failed_when: remote_file.rc != 0 or (remote_file.stdout | trim) == ''
+
+    - name: "Reset | reset-configuration + run-after-reset (link drops here)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/system/reset-configuration ' ~ reset_flags ~ ' run-after-reset=' ~ rsc_name] }}"
+      register: reset_cmd
+      changed_when: true
+      failed_when: false
+      # The session dies as the router reboots, so a non-zero rc is EXPECTED and
+      # not a failure. The down->up->identity checks below are the real proof.
+
+    - name: "Wait | SSH goes DOWN (reset/reboot actually started)"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: stopped
+        timeout: "{{ down_timeout }}"
+      # Never goes down? The reset did NOT take (e.g. a silent no-op). Don't
+      # assume success: investigate via console before continuing.
+
+    - name: "Wait | SSH comes BACK (script re-created SSH-on-mgmt)"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: started
+        delay: 10
+        timeout: "{{ up_timeout }}"
+
+    - name: "Verify | read identity back (retries while SSH settles)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put [/system/identity/get name]'] }}"
+      register: ident
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: ident.rc == 0
+
+    - name: "Verify | identity confirms the config applied"
+      ansible.builtin.assert:
+        that: (ident.stdout | trim) == inventory_hostname
+        fail_msg: >-
+          {{ inventory_hostname }} came back but identity is
+          '{{ ident.stdout | trim }}'. The run-after-reset script may not have
+          executed cleanly — check via console BEFORE continuing.
+        success_msg: "{{ inventory_hostname }} is back; identity matches — config applied."
+
+    # ---- ENFORCE: BRs never DHCP ether1 ------------------------------
+    # BR WANs are STATIC provider IPs on ether1. A belt-and-braces backstop only:
+    # the real purge now happens INSIDE the .rsc, before the static address is
+    # added (see br.rsc.j2 "PURGE FIRST").
+    #
+    # Do NOT rely on this task alone. It can't fix the two cases that matter,
+    # because both are already decided by the time ansible gets control back:
+    # if the factory dhcp-client held our exact address the import has already
+    # aborted mid-file, and if it held a different one its distance=1 default
+    # has already been stealing egress since boot. "no-defaults=yes means there
+    # is nothing to remove" was the assumption here, and it's false on at least
+    # the Vultr CHR image. Scoped to interface=ether1.
+    #
+    # BR-ONLY on purpose (router_role from inventory): ERs are free to DHCP any
+    # interface, including ether1, once home moves off statics onto the BGP
+    # block. Their WANs are data-driven in topology (address present => static,
+    # absent => dhcp-client), so this task must not touch them.
+    - name: "Enforce | remove any dhcp-client on ether1 (BRs are static-WAN)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/ip/dhcp-client remove [find interface=ether1]'] }}"
+      register: dhcp_purge
+      changed_when: false        # RouterOS `remove` is silent; can't detect a hit
+      failed_when: dhcp_purge.rc != 0
+      when: router_role | default('br') == 'br'
+
+    # ---- SECOND REBOOT: UNCONDITIONAL after any apply ---------------
+    # RouterOS doesn't apply `/ipv6/settings accept-router-advertisements`
+    # until the device reboots (WinBox flags it with a red banner).
+    #
+    # The sequence that makes this bite on EVERY deploy:
+    #   1. reset-configuration WIPES the config and restores the RA setting to
+    #      the factory default (yes-if-forwarding-disabled), then reboots.
+    #   2. run-after-reset applies our .rsc, which SETS the RA value. And that
+    #      is a change away from the factory default on every one of our routers.
+    #   3. Nothing reboots after step 2, so the new value never takes effect.
+    #
+    # Step 1's reboot doesn't count: it happens BEFORE our value is set. So the
+    # box needs a reboot with our value already in place, which means a second
+    # one, every single time the config is applied.
+    #
+    # UNCONDITIONAL on purpose. It's tempting to reboot only the routers that
+    # set `=yes`, but the factory default is `yes-if-forwarding-disabled`. So
+    # the ERs and br2 setting `=no` are changing it just as much as br1 setting
+    # `=yes`. Every router we apply config to switches this value. Beyond that,
+    # keeping it unconditional means any FUTURE reboot-requiring setting is
+    # already covered rather than needing this logic revisited.
+    #
+    # The cost is bounded: we only get here when the config actually changed
+    # (unchanged devices already ended the play above, untouched and un-rebooted),
+    # and the box was being wiped and rebooted anyway.
+    - name: "Reboot | second reboot so the IPv6 RA setting takes effect (link drops again)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/system/reboot'] }}"
+      register: post_reboot_cmd
+      changed_when: true
+      failed_when: false
+      # Same as the reset task: the session dies with the box, so a non-zero rc
+      # is EXPECTED. The down->up->verify sequence below is the real proof.
+
+    - name: "Reboot | wait for SSH to go DOWN (reboot started)"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: stopped
+        timeout: "{{ down_timeout }}"
+      # Never goes down? /system/reboot didn't execute. Check whether this
+      # RouterOS build is prompting for confirmation on a non-interactive SSH
+      # command. Do NOT assume the setting took effect.
+
+    - name: "Reboot | wait for SSH to come BACK"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: started
+        delay: 10
+        timeout: "{{ up_timeout }}"
+
+    - name: "Reboot | read identity back (retries while SSH settles)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put [/system/identity/get name]'] }}"
+      register: post_ident
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: post_ident.rc == 0
+
+    - name: "Reboot | identity survived the second reboot"
+      ansible.builtin.assert:
+        that: (post_ident.stdout | trim) == inventory_hostname
+        fail_msg: >-
+          {{ inventory_hostname }} came back from the second reboot with identity
+          '{{ post_ident.stdout | trim }}'. Check via console before continuing.
+        success_msg: "{{ inventory_hostname }} is back after the second reboot."
+
+    # ---- PROVE IT on the routers where the RA *is* the default route.
+    # Scoped to `gateway: ra` routers deliberately, and this is a different
+    # question from "who needs the reboot" (everyone does):
+    #   - br1 (RA)          the default EXISTS ONLY IF the reboot worked. This
+    #                       assertion is the actual proof. Keep it.
+    #   - br2 (fe80::1)     the default is a static route in the .rsc; it's
+    #                       present either way and proves nothing about the RA.
+    #   - er1/er2           have no v6 default of their own. Theirs arrives over
+    #                       iBGP once sessions establish, which isn't instant and
+    #                       isn't what this block is testing.
+    # Asserting ::/0 everywhere would fail the ERs for a reason unrelated to the
+    # reboot, so the check goes exactly where it carries information.
+    # grep -q prints nothing, so no key material from the .rsc reaches the log.
+    - name: "Reboot | is the v6 default RA-learned on this router?"
+      ansible.builtin.command:
+        argv: ["grep", "-q", "accept-router-advertisements=yes", "{{ rsc_path }}"]
+      register: ra_grep
+      changed_when: false
+      failed_when: false
+
+    - name: "Reboot | verify an ACTIVE IPv6 default route now exists"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put [:len [/ipv6/route/find where dst-address=\"::/0\" && active]]'] }}"
+      register: ra_default
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: ra_default.rc == 0 and (ra_default.stdout | trim | int) > 0
+      failed_when: false
+      when: ra_grep.rc == 0
+
+    - name: "Reboot | assert the RA-learned IPv6 default is present"
+      ansible.builtin.assert:
+        that: (ra_default.stdout | default('0') | trim | int) > 0
+        fail_msg: >-
+          {{ inventory_hostname }} has accept-router-advertisements=yes but STILL
+          has no active ::/0 route after the second reboot. IPv6 egress is dead on
+          this box (v4 is fine, which is why nothing else complains). Check on the
+          router: /ipv6/settings print ; /ipv6/route print where dst-address="::/0"
+          and confirm the upstream is actually sending RAs on ether1.
+        success_msg: "{{ inventory_hostname }}: active RA-learned IPv6 default present."
+      when: ra_grep.rc == 0
+
+    # ---- RECORD STATE: only after a verified deploy -----------------
+    - name: "State | write the applied fingerprint locally"
+      ansible.builtin.copy:
+        content: "{{ local_fp }}\n"
+        dest: "{{ marker_write }}"
+        mode: "0644"
+
+    - name: "State | stash the fingerprint on the device (<fqdn>.applied)"
+      ansible.builtin.command:
+        argv: "{{ ['scp', '-O', '-P', ssh_port | string] + ros_ssh_opts + [marker_write, router_user ~ '@' ~ router_address ~ ':' ~ marker_name] }}"
+      register: marker_push
+      changed_when: true
+      failed_when: false
+      # Non-fatal: the deploy already succeeded. A failed push just means the
+      # next run re-detects "changed" and offers to redeploy (safe false-positive).
+
+    - name: "State | warn if the fingerprint did not get stored"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: could not stash the fingerprint on {{ inventory_hostname }}
+          (rc={{ marker_push.rc }}). Deploy still succeeded; next run will treat
+          this device as changed.
+      when: marker_push.rc != 0
+
+    - name: "Done"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} deployed and fingerprinted. Do your own health
+          checks (BGP sessions, OSPF adjacencies, the anchor) before the next gate.

@@ -1,0 +1,222 @@
+# =====================================================================
+#  Job bodies for the generated rollout pipeline.
+#
+#  out/pipeline.yml is GENERATED from topology.yml and names the routers and
+#  the order. This file holds what those jobs actually DO, and it's committed
+#  so it shows up in a diff and gets reviewed like any other code. Generated
+#  YAML gets skimmed; the shell that resets a live border router shouldn't be
+#  in the part that gets skimmed.
+#
+#  Every job here re-renders the configs from the checked-out commit rather
+#  than downloading them as artifacts. That's deliberate and it's the reason
+#  the pipeline needs no secret in its artifact store:
+#
+#    - out/*.rsc contain WireGuard PRIVATE KEYS. Passing them between jobs
+#      would copy them into GitLab's artifact store, where they persist for the
+#      expiry window and are downloadable by anyone with project access.
+#    - the generator is deterministic, so re-rendering produces byte-identical
+#      files (tests/unit/test_determinism.py asserts exactly this), and the
+#      --use-pin file from the build job freezes the two URL fetches so even
+#      the network can't make two renders differ.
+#
+#  So the artifacts that travel are manifest.json, inventory.yml and pin.json,
+#  none of which contain key material. tests/unit/test_secrets.py enforces
+#  that on every merge.
+#
+#  ANSIBLE ORCHESTRATES, PYTEST ASSERTS
+#  ------------------------------------
+#  The deploy jobs run a playbook, because uploading a config, resetting a
+#  router, waiting for it to come back and recording a fingerprint is ordering
+#  and retries: Ansible's actual job.
+#
+#  The verify jobs run pytest, because assertions want structured data, real
+#  fixtures, and a JUnit report GitLab can render per check. The probes read
+#  RouterOS over the same SSH the deploy uses (`:serialize to=json`), NOT the
+#  REST API: the templates disable www/www-ssl/api/api-ssl by name, and turning
+#  one back on would add a listening service to a router facing the DFZ purely
+#  in order to check on it. See tests/functional/routeros.py.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+#  Shared setup: unpack the two secrets, render, and be ready to talk SSH.
+# ---------------------------------------------------------------------
+.rollout_base:
+  # A stock public image with the toolchain installed per job, NOT a custom one
+  # from a registry. See the long note in .gitlab-ci.yml: $CI_REGISTRY is unset
+  # unless the GitLab instance has the container registry enabled, and building
+  # a custom image needs a privileged runner for dind. Neither is worth
+  # requiring for python + ansible-core + ssh.
+  #
+  # A child pipeline can't `extends:` a template from its parent, so the
+  # install is repeated here rather than shared. That's the one real cost of
+  # the parent/child split, and it's a handful of lines.
+  image: python:3.12-slim-bookworm
+  cache:
+    key: "pip-$CI_COMMIT_REF_SLUG"
+    paths: [.pipcache]
+  # Serialises EVERY job that touches the fleet, across all pipelines. Without
+  # it two merges landing minutes apart would reset the same router from two
+  # runners at once, and the second would be applying a config built from a
+  # commit the first has already superseded.
+  resource_group: production
+  variables:
+    ANSIBLE_CONFIG: ansible/ansible.cfg
+    ANSIBLE_FORCE_COLOR: "1"
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pipcache"
+  before_script:
+    - python -m pip install --quiet --upgrade pip
+    - pip install --quiet -r requirements-dev.txt
+    # openssh-client: every router interaction is ssh/scp.
+    # iputils-ping:   the end-to-end ICMP checks run from this container.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client iputils-ping
+    # KEYS_JSON and SSH_PRIVATE_KEY are FILE-type CI variables, PROTECTED and
+    # deliberately NOT masked: GitLab masks single-line values only, and both
+    # of these are multi-line by nature. File type rather than a plain variable
+    # for the same reason: a private key with newlines in an environment
+    # variable is a class of bug nobody needs.
+    - |
+      for v in KEYS_JSON SSH_PRIVATE_KEY; do
+        eval "path=\$$v"
+        test -n "$path" || { echo "$v is empty. Set it in Settings -> CI/CD -> Variables as Type=File and Protected (NOT masked -- GitLab rejects multi-line values)."; exit 1; }
+        test -f "$path" || { echo "$v is set to '$path' but that file does not exist. A File-type variable holds a PATH; a plain Variable holds the CONTENT. This one looks like the wrong type."; exit 1; }
+      done
+    - install -m 600 "$KEYS_JSON" keys.json
+    - mkdir -p ~/.ssh && install -m 600 "$SSH_PRIVATE_KEY" ~/.ssh/id_ed25519
+    # No known_hosts entry is pinned on purpose: reset-configuration
+    # regenerates the router's host key, so a pinned entry would break the
+    # post-reset reconnect. The playbooks pass StrictHostKeyChecking=no for the
+    # same reason. What protects this path is that it runs on a runner inside
+    # the management prefixes, reaching addresses the generator derived.
+    - test -f out/pin.json || { echo "out/pin.json missing -- the build job's artifacts did not arrive."; exit 1; }
+    - |
+      # Log in as the AUTOMATION user, read from the manifest rather than named
+      # again here. topology.yml declares it once; a GitLab variable holding a
+      # second copy is a second thing to forget, and the symptom of the two
+      # disagreeing is a permission error that reads like a dead router.
+      ROUTER_USER=$(python3 -c "import json;a=json.load(open('out/manifest.json')).get('automation');print((a or {}).get('user') or '')")
+      test -n "$ROUTER_USER" || { echo "topology.yml has no automation: block, so there is no CI login to use. See docs/netdevops.md."; exit 1; }
+      echo "export ROUTER_USER=$ROUTER_USER" > ci.env
+      echo "Logging in to the fleet as '$ROUTER_USER'"
+    - |
+      # Keep the build job's answers, then re-render and compare. This is the
+      # link between "the tests passed" and "this is what gets deployed":
+      # without it the deploy job renders in good faith from the same commit
+      # and can still produce something different, because two of the
+      # generator's inputs are URLs rather than files.
+      mkdir -p /tmp/from-build
+      cp out/manifest.json out/inventory.yml /tmp/from-build/
+      python3 generate.py --use-pin out/pin.json
+    - |
+      if ! diff -u /tmp/from-build/inventory.yml out/inventory.yml \
+         || ! diff -u /tmp/from-build/manifest.json out/manifest.json; then
+        echo
+        echo "The re-render does not match what the build job produced and tested."
+        echo "Deploying it would mean shipping a config no test has seen."
+        exit 1
+      fi
+      echo "Re-render matches the tested build."
+  after_script:
+    # Belt and braces. The runner is on-prem and long-lived, so a keystore left
+    # in a build directory is a keystore sitting on a disk somebody else can
+    # reach.
+    - shred -u keys.json 2>/dev/null || rm -f keys.json
+    - rm -f ~/.ssh/id_ed25519 ci.env
+
+# ---------------------------------------------------------------------
+#  Pre-flight: is the fleet healthy before we touch anything?
+# ---------------------------------------------------------------------
+.baseline:
+  extends: .rollout_base
+  stage: rollout
+  script:
+    # The same suite the per-router gates run, against the whole untouched
+    # fleet. Identical checks on purpose: a baseline weaker than the gate
+    # can't tell you the gate would have passed.
+    - . ./ci.env
+    - pytest tests/functional -q --junitxml=baseline-report.xml
+  # If this fails, nothing is deployed. That's the point: a rollout onto an
+  # already-broken network either makes it worse or accidentally fixes it, and
+  # both outcomes destroy the evidence of what was actually wrong.
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths: [out/manifest.json]
+    reports:
+      junit: baseline-report.xml
+
+# ---------------------------------------------------------------------
+#  Deploy ONE router.
+# ---------------------------------------------------------------------
+.deploy_router:
+  extends: .rollout_base
+  stage: rollout
+  script:
+    - echo "Deploying $ROUTER ($ROUTER_ROLE)"
+    # --limit one host, gate=auto because there's nobody here to press ENTER.
+    # The confirmation that used to be a prompt is now the previous router's
+    # verify job, expressed as a needs: edge in the generated pipeline.
+    - . ./ci.env
+    - ansible-playbook ansible/deploy.yml --limit "$ROUTER" -e gate=auto -e router_user="$ROUTER_USER"
+  # A failed deploy leaves a router that has ALREADY been reset. There's no
+  # automatic rollback and there shouldn't be: rolling back means rendering
+  # the previous commit's config and running the same destructive apply again,
+  # on a box that just demonstrated it doesn't come back cleanly. Read
+  # ansible/README.md, open the provider console, and decide.
+  timeout: 30m
+
+# ---------------------------------------------------------------------
+#  Prove ONE router, before the next one is touched.
+# ---------------------------------------------------------------------
+.verify_router:
+  extends: .rollout_base
+  stage: rollout
+  script:
+    - . ./ci.env
+    - echo "Verifying $ROUTER as $ROUTER_USER, then asking the rest of the fleet whether they still see it"
+    # --router limits the per-router checks to the one just deployed.
+    # --focus adds the cross-check: every OTHER router must still reach it. A
+    #   router can pass every check about itself while a peer can't reach it at
+    #   all: a mismatched WireGuard listen port does exactly that, and only
+    #   the peer knows.
+    # The end-to-end tests run here too, after EVERY router rather than only at
+    # the end, because "the deployment can be considered successful" has to mean
+    # the network still works, not that one box came back.
+    - >
+      pytest tests/functional -q
+      --router "$ROUTER" --focus "$ROUTER"
+      --junitxml=verify-$ROUTER.xml
+  artifacts:
+    when: always
+    expire_in: 30 days
+    reports:
+      junit: verify-$ROUTER.xml
+  timeout: 25m
+
+# ---------------------------------------------------------------------
+#  The whole fleet, converged.
+# ---------------------------------------------------------------------
+.e2e:
+  extends: .rollout_base
+  stage: rollout
+  script:
+    - . ./ci.env
+    - pytest tests/functional -q --junitxml=e2e-report.xml
+  artifacts:
+    when: always
+    expire_in: 30 days
+    reports:
+      junit: e2e-report.xml
+  timeout: 25m
+
+# ---------------------------------------------------------------------
+#  Failover, proved. Manual, and never anything else.
+# ---------------------------------------------------------------------
+.chaos:
+  extends: .rollout_base
+  stage: chaos
+  when: manual
+  allow_failure: false
+  script:
+    - . ./ci.env
+    - ansible-playbook ansible/chaos.yml -e scenario="${CHAOS_SCENARIO:-all}" -e router_user="$ROUTER_USER"
+  timeout: 40m

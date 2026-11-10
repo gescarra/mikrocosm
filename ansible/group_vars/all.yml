@@ -1,0 +1,127 @@
+# =====================================================================
+#  Operational variables for every playbook here.
+#
+#  These moved out of inventory.yml when the inventory became GENERATED
+#  (out/inventory.yml, from topology.yml). The split is the point:
+#
+#    inventory  = facts about the fleet      -> derived, overwritten each build
+#    group_vars = decisions about the rollout -> committed, reviewed, tunable
+#
+#  A hand-tuned timeout inside a generated file lasts until the next
+#  ./build.sh. Everything here survives.
+# =====================================================================
+ansible_connection: local
+
+# The login on the routers, for a HUMAN running a playbook by hand. Preserved
+# across reset-configuration by keep-users=yes.
+#
+# CI doesn't use this. The pipeline logs in as `automation.user` from
+# topology.yml, read out of out/manifest.json and passed as
+# `-e router_user=...`. So the machine account is named in exactly one place
+# and this default stays what it should be: whoever is at the keyboard.
+router_user: netops
+ssh_port: 22
+
+# --- which address do we reach a router on? --------------------------
+# false (the default) uses `ansible_host` from the generated inventory: the
+# address for a control node INSIDE the AS. For a border router that's its
+# LOOPBACK, over the tunnels.
+#
+# true switches to `bootstrap_host`, which for a BR is its provider WAN. That
+# is the failsafe: it works when the overlay doesn't, and it's the only thing
+# that works from a control node OUTSIDE the AS.
+#
+# >>> A BR's PUBLIC ADDRESS DOES NOT WORK FROM INSIDE 203.0.113.0/24, which
+# >>> is why the default is what it's. The ERs statically route each BR's
+# >>> public /32 out their own WAN (a WireGuard endpoint must never resolve
+# >>> through a tunnel), so the request leaves via the ISP. While the BR
+# >>> answers an in-AS source down a tunnel, using the /25 it learns over iBGP.
+# >>> Asymmetric, and it hangs. See ansible_host() in emit.py for the measured
+# >>> routing tables.
+#
+# Using the in-AS address also means a deploy can't proceed until the overlay
+# has actually come back, which is a gate worth having rather than a cost.
+#
+#   ansible-playbook deploy.yml -e use_bootstrap=true     # from outside, or
+#                                                         # when tunnels are down
+use_bootstrap: false
+
+# Resolved once here so no playbook picks the address for itself.
+router_address: "{{ bootstrap_host if use_bootstrap | bool else ansible_host }}"
+
+out_dir: "{{ playbook_dir }}/../out"
+manifest_path: "{{ out_dir }}/manifest.json"
+
+# SSH options used for every ssh/scp to a router.
+#  - StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null are REQUIRED:
+#    reset-configuration regenerates the router's host key, so any pinned
+#    known_hosts entry would break the post-reset reconnect.
+#  - BatchMode=yes fails fast instead of hanging on a password prompt.
+ros_ssh_opts:
+  - -o
+  - StrictHostKeyChecking=no
+  - -o
+  - UserKnownHostsFile=/dev/null
+  - -o
+  - ConnectTimeout=10
+  - -o
+  - BatchMode=yes
+
+# --- Zabbix (zabbix-snmp-reload.yml) ---------------------------------
+# After a RouterOS package install the upgrade playbooks flush Zabbix's
+# SNMPv3 engine cache, because RouterOS resets engineBoots on install and
+# Zabbix discards every reply until the cache is cleared.
+#
+# root for now; moves with Zabbix into the k8s build. No StrictHostKeyChecking
+# override here, unlike the routers: this host's key doesn't rotate, so a
+# changed key is worth stopping for.
+zabbix_snmp_reload: true            # -e zabbix_snmp_reload=false to skip
+zabbix_ssh_target: root@172.20.3.100
+zabbix_container: zabbix-server
+zabbix_ssh_opts: [-o, ConnectTimeout=10, -o, BatchMode=yes]
+
+reset_flags: "no-defaults=yes skip-backup=yes keep-users=yes"
+
+down_timeout: 180     # seconds to see SSH drop (reset + reboot begins)
+up_timeout:   420     # seconds for the box to reboot and re-open SSH
+
+# --- gating ----------------------------------------------------------
+# `manual` stops at a pause prompt before every router, which is what you want
+# at a terminal. `auto` skips the prompt, which is the only thing that works in
+# a pipeline: there's nobody to press ENTER.
+#
+# The default is MANUAL on purpose. A flag that has to be passed explicitly is
+# a flag somebody chose; a default of `auto` would mean the safe behaviour
+# depends on remembering to ask for it. CI passes -e gate=auto.
+gate: manual
+
+# --- convergence budget ----------------------------------------------
+# How long the functional gate waits for a freshly-reset router to come back
+# to full health. Generous on purpose: BGP sessions, OSPF adjacencies and BFD
+# all have to re-form, and the cost of a too-short budget is a failed rollout
+# on a router that was about to be fine.
+converge_retries: 30
+converge_delay: 10
+
+# --- end-to-end ------------------------------------------------------
+# Public endpoints the e2e test uses. All of them are read-only GETs of public
+# information; the reflectors return OUR OWN public address, which is the
+# assertion. Listed rather than hardcoded so a dead service is a config change,
+# not a red pipeline.
+e2e_ping_targets_v4: [1.1.1.1, 8.8.8.8]
+e2e_ping_targets_v6: ["2606:4700:4700::1111", "2001:4860:4860::8888"]
+e2e_dns_names: [one.one.one.one, www.google.com]
+e2e_reflectors_v4:
+  - https://api.ipify.org
+  - https://ipv4.icanhazip.com
+e2e_reflectors_v6:
+  - https://api6.ipify.org
+  - https://ipv6.icanhazip.com
+# A transfer big enough that a wrong MSS clamp stalls it instead of merely
+# being slow. ICMP will never find that fault; this is what does.
+e2e_bulk_url: https://speed.cloudflare.com/__down?bytes=8000000
+e2e_bulk_min_bytes: 8000000
+e2e_bulk_timeout: 60
+# RIPE RIS: is our prefix still visible in the DFZ, from the right origin?
+# Advisory only: see the note in e2e.yml.
+e2e_ris_url: https://stat.ripe.net/data/routing-status/data.json

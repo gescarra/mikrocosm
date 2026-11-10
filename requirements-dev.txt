@@ -1,0 +1,13 @@
+# Everything needed to RUN the pipeline's checks locally, and what every CI job
+# installs. requirements.txt is the generator's own dependencies and stays
+# minimal on purpose: it's what build.sh bootstraps onto a machine that only
+# wants to render a config.
+-r requirements.txt
+
+pytest>=8.0             # the unit suite AND the functional gate
+ansible-core>=2.16      # deploy.yml, chaos.yml, upgrade.yml
+
+# No Ansible COLLECTIONS are needed. Everything the playbooks use is
+# ansible.builtin. The assertions that once needed ansible.utils.in_network
+# live in tests/functional now. That's what lets a CI job install its whole
+# toolchain with one pip command and no ansible-galaxy step.

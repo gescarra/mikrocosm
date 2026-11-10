@@ -1,0 +1,528 @@
+{# =====================================================================
+   Management plane. INCLUDED BY BOTH br.rsc.j2 AND er.rsc.j2.
+
+   Shared because the whole block is byte-identical on every router and it's
+   the one block where drift locks you out of the fleet. Needs `t` only.
+   ===================================================================== #}
+{# The committed floor and the build-time fetch stay separate on purpose.
+   See resolve_mgmt_prefixes() in generate.py. The service ACL is the union
+   (both are valid sources right now); the address-list comments are what let
+   mgmt-refresh tell one from the other later. #}
+   {# Touch this file the way you'd defuse something: slowly, and with console access. #}
+{% set mgmt_fetched = t.mgmt_prefixes_fetched | default([]) %}
+{% set mgmt_list = (t.mgmt_prefixes + mgmt_fetched) | join(',') %}
+# --- resolver + clock -------------------------------------------------
+# FIRST in this file because /import is strictly ordered (AD-LOG §20.2) and
+# everything downstream that touches a name or a certificate needs both of
+# these already in place.
+#
+# Public anycast on every router, BRs and ERs alike. The edge doesn't resolve
+# through internal DNS: not through pfSense, not through anything behind a
+# tunnel. Reaching the rest of the network is what these boxes are FOR, so
+# nothing they need to boot may sit on the far side of them.
+/ip/dns
+set servers={{ t.dns_servers | join(',') }}
+# allow-remote-requests=no explicitly, not just by default. The input chains
+# already drop UDP/53 from the WAN, but they also `accept src-address-list=mgmt`
+# wholesale: so the firewall is the ONLY thing between a public-WAN router and
+# being a DNS amplification reflector. This line survives a future firewall edit
+# that the drop rule wouldn't.
+set allow-remote-requests=no
+
+/system/ntp/client
+set enabled=yes mode=unicast servers={{ t.ntp_servers | join(',') }}
+# UTC everywhere, autodetect off. Autodetect infers the zone from the router's
+# public IP, which silently makes log timestamps a function of which provider a
+# BR happens to sit behind. And correlating a 3am event across four routers is
+# hard enough without three of them disagreeing about what 3am was.
+/system/clock
+set time-zone-autodetect=no time-zone-name=UTC
+
+# --- services --------------------------------------------------------
+# Addressed by [find where !dynamic name="X"] rather than by bare name, because
+# on 7.19+ /ip/service is a PORT TABLE: alongside the real service entries it
+# lists a dynamic row per live TCP/UDP port, including the SSH session this
+# import is running over. Measured on 7.24:
+#
+#     /ip/service find where name="ssh"            -> 2
+#     /ip/service find where !dynamic name="ssh"   -> 1
+#
+# The bare form has in fact been resolving to the right row (every router in
+# the fleet has the ACL correctly applied), so this isn't a bug fix. It's
+# removing an ambiguity that only ever had to break once. Same reasoning as the
+# `!dynamic` qualifier AD-LOG §21 added to mgmt-refresh.
+#
+# >>> `address=` IS DEPRECATED ON 7.24, renamed `available-from`:
+# >>>     Deprecation warning: address (IP address from which the service is
+# >>>     accessible). Preceding keywords will be removed in future versions.
+# >>> It's deliberately still used here. `available-from` does NOT exist on
+# >>> 7.23.x, and this fleet is mixed (er2 is on 7.23.3), so switching now
+# >>> would abort the import on the older box. After reset-configuration has
+# >>> wiped it. `address=` still applies correctly on both and only warns.
+# >>> Switch once every router is past 7.23, and not before.
+# >>>
+# >>> READING it back is the opposite problem: on 7.24 `get ... address`
+# >>> returns EMPTY while `available-from` holds the value, so anything that
+# >>> checks this ACL must try both. The guard below does; so should you,
+# >>> before concluding a router is unfiltered.
+/ip/service
+{% for svc in ("ftp", "telnet", "www", "www-ssl", "reverse-proxy", "api", "api-ssl") %}
+set [find where !dynamic name="{{ svc }}"] disabled=yes
+{% endfor %}
+# SSH on, bound to mgmt. The kill switch and any Ansible workflow need it.
+set [find where !dynamic name="ssh"] disabled=no address={{ mgmt_list }}
+# Winbox on, bound to the SAME list. Kept enabled rather than disabled because
+# it's the only GUI path into a router whose SSH you have just broken, and it
+# is the tool you actually want during a bad push. Enabled-and-open is the
+# thing that was wrong: winbox defaults to every source address, and the
+# service is a well-known scan target on any provider WAN.
+set [find where !dynamic name="winbox"] disabled=no address={{ mgmt_list }}
+# Prove it took, rather than trusting that it did. A source ACL that failed to
+# apply is indistinguishable from one that applied, right up until somebody
+# scans the WAN.
+#
+# TWO property names, tried in order, and getting this wrong is worse than not
+# checking at all:
+#   - 7.24+ holds the list in `available-from`; reading `address` there returns
+#     EMPTY even when the ACL is correctly set.
+#   - 7.23.x has only `address` and no `available-from` at all, so reading it
+#     raises rather than returning nothing.
+# A guard that only read `address` would log this error on every correctly
+# configured 7.24 router in the fleet. That isn't a harmless false positive:
+# an alarm that cries wolf on healthy routers is one people learn to skip, and
+# then it's not there on the day it's true.
+#
+# The value is a LIST, so emptiness is [:len ...] = 0. `address=""` matches
+# neither the set nor the unset case (verified on both versions).
+{% for svc in ("ssh", "winbox") %}
+:local acl{{ loop.index }} 0
+:do { :set acl{{ loop.index }} [:len [/ip/service/get [find where !dynamic name="{{ svc }}"] available-from]] } \
+  on-error={ :do { :set acl{{ loop.index }} [:len [/ip/service/get [find where !dynamic name="{{ svc }}"] address]] } on-error={} }
+:if ($acl{{ loop.index }} = 0) do={
+  :log error "{{ svc | upper }} SOURCE ACL DID NOT APPLY - {{ svc }} is open to every address on this router. Do not trust it until fixed."
+}
+{% endfor %}
+
+# --- close the L2 back door ------------------------------------------
+# MAC-telnet and MAC-Winbox reach the router by MAC address, on the ETHERNET
+# SEGMENT, with no IP involved at all. So the source ACLs above don't apply
+# to them. Leaving them at the RouterOS default (`all` interfaces) makes every
+# lock on this page decorative for anyone sharing an L2 domain with us.
+#
+# On a BR that domain is a VPS provider's access segment, shared with other
+# tenants. On an ER it's the transit segment to pfSense.
+#
+# `none` on both. The recovery path this gives up is "plug a laptop into the
+# segment and MAC-Winbox in", which is only reachable if you're already
+# physically present: and if you're physically present you have serial
+# console, which is strictly better. If you ever want that path back on the
+# ERs specifically, put ONE interface in a list and name it here rather than
+# reverting to `all`.
+/tool/mac-server set allowed-interface-list=none
+/tool/mac-server/mac-winbox set allowed-interface-list=none
+/tool/mac-server/ping set enabled=no
+
+# --- bandwidth server ------------------------------------------------
+# btest is genuinely useful on this fleet. It's the only built-in way to
+# measure what a tunnel actually carries, which is the number wg_mtu and the
+# MSS clamps are all downstream of.
+#
+# It was previously not mentioned here AT ALL, which meant it ran at the
+# RouterOS default: enabled, on udp/tcp 2000, open to every source address. On
+# a router with a working input chain that's academic. The terminal drop
+# catches it. On br1 after a half-applied import it was the one thing actually
+# listening to the internet, which is the argument for stating it rather than
+# inheriting it.
+#
+# `allowed-addresses4` restricts it to the same management prefixes SSH and
+# winbox use, so this is belt-and-braces with the firewall rather than a
+# replacement for it. Both properties exist on 7.23.3 and 7.24. Checked on
+# the live fleet before writing this, because `available-from` above is a
+# standing reminder that RouterOS renames things between releases and a line
+# that aborts the import lands on a box reset-configuration has already wiped.
+#
+# `allowed-addresses6` is set to loopback rather than left empty. Empty means
+# EVERY v6 source, and the management plane here is deliberately v4-only
+# (generate.py refuses a v6 entry in mgmt_prefixes, because the v6 input chains
+# carry no management hole). Denying it explicitly beats relying on the v6
+# firewall to be the only thing in the way.
+#
+# `authenticate=yes` is the RouterOS default and is restated for the same
+# reason everything else in this block is: a default isn't a decision.
+# Credentials are the router user's. See user_password_for() in generate.py
+# for where that password lives if you ever need to run a test.
+#
+# Set `bandwidth_server: false` in topology.yml to turn it off instead.
+/tool/bandwidth-server
+{% if t.get('bandwidth_server', True) %}
+set enabled=yes authenticate=yes \
+    allowed-addresses4={{ mgmt_list }} \
+    allowed-addresses6=::1/128
+{% else %}
+set enabled=no
+{% endif %}
+
+# --- management source addresses -------------------------------------
+# comment="mgmt-static" isn't decoration: it's what mgmt-refresh
+# uses to tell the committed floor from its own entries, and the script only
+# ever removes "mgmt-dynamic". Rename these and a bad API response can delete
+# your break-glass access.
+/ip/firewall/address-list
+{% for p in t.mgmt_prefixes %}
+add list=mgmt address={{ p }} comment="mgmt-static"
+{% endfor %}
+{% if mgmt_fetched %}
+# From {{ t.mgmt_prefixes_url }} at build time. Rendered as "mgmt-dynamic"
+# rather than "mgmt-static" so mgmt-refresh can REMOVE them once the endpoint
+# stops listing them. Baking a fetched address in as static would make an
+# address you meant to be revocable permanent on the device.
+{% for p in mgmt_fetched %}
+add list=mgmt address={{ p }} comment="mgmt-dynamic"
+{% endfor %}
+{% endif %}
+
+{% if t.snmp is defined and t.snmp and t.snmp.enabled %}
+# --- SNMP poller sources ---------------------------------------------
+# A SEPARATE list from `mgmt`, and that separation is the whole design.
+# Everything on `mgmt` is accepted WHOLESALE by the input chain. Every
+# protocol, every port, SSH and Winbox included. A monitoring system doesn't
+# need that: it needs udp/161 and nothing else, and it's the one box on the
+# network that talks to every router while also being a web application with
+# users, plugins and a database. Putting the poller on `mgmt` would trade the
+# fleet's entire management surface for a saved line of config.
+#
+# The matching accept lives in the input chain of each router template, one
+# rule, `protocol=udp dst-port=161 src-address-list=snmp`.
+/ip/firewall/address-list
+{% for p in t.snmp.sources %}
+add list=snmp address={{ p }} comment="snmp-poller"
+{% endfor %}
+{% endif %}
+
+{% if t.ssh is defined and t.ssh %}
+# --- management SSH keys for {{ t.ssh.user }} -------------------------
+# Public keys fetched at build time from {{ t.ssh.keys_url }}.
+# Idempotent: create the user if missing, clear its keys, re-import fresh.
+#
+# The clear-then-import order is safe HERE and only here: generate.py refuses
+# to render at all if the fetch returned zero keys, so by the time this file
+# exists the replacement set is already known-good and sitting in it. The
+# on-router script below can't make that promise, which is why it does the
+# opposite (import first, remove second).
+#
+# `password=` is NOT optional. /user/add aborts without it, and this branch only
+# fires on a router that has never been deployed (keep-users=yes preserves the
+# account otherwise): so the one time it runs is the first apply on a new box,
+# with no firewall and no tunnels yet. The value is a random throwaway from the
+# keystore that nobody ever types; see user_password_for() in generate.py.
+:if ([:len [/user find name={{ t.ssh.user }}]] = 0) do={ /user add name={{ t.ssh.user }} group=full password="{{ t.ssh.password }}" comment="key-only; managed by generate.py" }
+/user/ssh-keys/remove [find user={{ t.ssh.user }}]
+{% for k in t.ssh['keys'] %}
+/file/add name="{{ t.ssh.user }}-key{{ loop.index }}.pub" contents="{{ k }}"
+/user/ssh-keys/import user={{ t.ssh.user }} public-key-file="{{ t.ssh.user }}-key{{ loop.index }}.pub"
+/file/remove [find name="{{ t.ssh.user }}-key{{ loop.index }}.pub"]
+{% endfor %}
+{% endif %}
+
+{% if t.automation is defined and t.automation %}
+# --- automation login: {{ t.automation.user }} ------------------------
+# The CI runner's account. SEPARATE from {{ t.ssh.user if t.ssh else 'the human user' }} above, and with the
+# opposite key lifecycle: human keys are fetched from an endpoint and churn as
+# devices come and go; this one is static, committed to topology.yml, and
+# changes only when someone edits that file. Either can be revoked without
+# touching the other, which is the entire reason there are two.
+#
+# THE PRIVATE HALF IS NOT HERE and never will be. It lives in GitLab as a
+# masked, protected, File-type variable. What is below is the public half,
+# which is public by definition.
+{% if t.automation.group != 'full' %}
+# The group is rendered from `automation.policies`, not from a builtin. Set to
+# exactly what the deploy and the tests need, and NOTHING else. No winbox, no
+# web, no api/rest-api, no romon, no sniff, no sensitive. That doesn't make
+# this least privilege (a user that can reset-configuration can reload a router
+# with any config it likes, so `write` is the whole farm), but it does close
+# every OTHER door: this key can't open a GUI, can't drive the API, can't
+# capture traffic, and can't read secrets back out of /export.
+#
+# set-if-present rather than add-only: the policy list is a thing that gets
+# edited, and a group that silently keeps its old rights after topology.yml
+# changed is exactly the drift this repo exists to remove.
+{# Granted, then everything else denied BY NAME. An unlisted RouterOS policy
+   takes its default rather than being denied. `sensitive` came out granted
+   the first time this shipped, so the group could read private keys out of
+   /export while topology.yml said it couldn't. #}
+/user/group
+:if ([:len [/user/group find name={{ t.automation.group }}]] = 0) \
+  do={ /user/group add name={{ t.automation.group }} policy={{ t.automation.policy_string }} comment="CI runner; managed by generate.py" } \
+  else={ /user/group set [find name={{ t.automation.group }}] policy={{ t.automation.policy_string }} }
+{% endif %}
+# Same set-if-present shape, so changing `group:` in topology.yml actually
+# MOVES an existing account rather than leaving it where it was.
+:if ([:len [/user find name={{ t.automation.user }}]] = 0) \
+  do={ /user add name={{ t.automation.user }} group={{ t.automation.group }} password="{{ t.automation.password }}" comment="CI runner; key-only; managed by generate.py" } \
+  else={ /user set [find name={{ t.automation.user }}] group={{ t.automation.group }} }
+# Clear-then-import, safe for the same reason it's safe above: generate.py
+# refuses to render at all when automation.keys is empty, so the replacement
+# set is already known-good and sitting in this file.
+/user/ssh-keys/remove [find user={{ t.automation.user }}]
+{% for k in t.automation['keys'] %}
+/file/add name="{{ t.automation.user }}-ci{{ loop.index }}.pub" contents="{{ k }}"
+/user/ssh-keys/import user={{ t.automation.user }} public-key-file="{{ t.automation.user }}-ci{{ loop.index }}.pub"
+/file/remove [find name="{{ t.automation.user }}-ci{{ loop.index }}.pub"]
+{% endfor %}
+{% endif %}
+
+{% if t.mgmt_refresh is defined and t.mgmt_refresh %}
+# =====================================================================
+#  mgmt-refresh: re-pull SSH keys + mgmt source addresses on a schedule
+# =====================================================================
+# PLACEHOLDER: the guards are real, the endpoint contract is provisional.
+# Both URLs must return one entry per line; blank lines and `#` comments are
+# ignored (matches what the sshkeys endpoint already emits).
+#
+# WHY IT EXISTS: an admin address that changes shouldn't require a config
+# push, and a config push on this fleet means `reset-configuration` (README).
+# Re-rendering the whole device to add one /32 is a wildly disproportionate
+# blast radius for the change being made.
+#
+# ---------------------------------------------------------------------
+# THE SAFETY PROPERTY, stated plainly, because it's the entire point:
+#
+#   NO FETCH FAILURE, EMPTY RESPONSE, OR MALFORMED RESPONSE CAN EVER REMOVE
+#   ACCESS. The script only ever subtracts from what it previously added.
+#
+# Four independent mechanisms, because this has bitten before. An endpoint
+# returning 200 with an empty body wiped a key set and locked out the host:
+#
+#   1. FETCH FAILS -> the :do/on-error sets ok=false and NOTHING is applied.
+#      Not "apply what we got": nothing. Both halves abort together.
+#   2. EMPTY OR MALFORMED -> a parse that yields zero entries, or any prefix
+#      line that isn't <ip>/<len>, is treated exactly like a failed fetch.
+#      A 200 with an empty body is the case that caused the outage, and it's
+#      indistinguishable here from a 500.
+#   3. ADD BEFORE REMOVE, ALWAYS -> new keys are imported and verified present
+#      before a single old key is touched; new addresses are added before
+#      stale ones are pruned. There's no instant at which the router has zero
+#      keys or zero mgmt sources, so a reboot or a lost session mid-run leaves
+#      a working device.
+#   4. THE FLOOR IS UNTOUCHABLE -> `$floor` is baked in as a literal below and
+#      re-emitted into the service ACL on every run. Entries carrying
+#      comment="mgmt-static" are never removed. Even a fully compromised
+#      endpoint returning garbage that somehow passed 1-3 can't take away the
+#      access committed in topology.yml.
+#
+# `policy` is in the policy list because writing /user/ssh-keys requires it;
+# without it the script fails at the import with a permission error.
+# ---------------------------------------------------------------------
+/system/script
+add name=mgmt-refresh policy=read,write,test,policy source={
+  # ---- baked at build time --------------------------------------------
+  :local floor { {% for p in t.mgmt_prefixes %}"{{ p }}"{% if not loop.last %}; {% endif %}{% endfor %} }
+  :local pfxUrl "{{ t.mgmt_prefixes_url }}"
+  :local keyUrl "{{ t.ssh.keys_url }}"
+  :local user   "{{ t.ssh.user }}"
+
+  # ---- line splitter: drops blanks, `#` comments, and trailing CR ------
+  :local parse do={
+    :local out [:toarray ""]
+    :local s $1
+    :while ([:len $s] > 0) do={
+      :local n [:find $s "\n"]
+      :local line ""
+      :if ([:typeof $n] = "nil") do={
+        :set line $s
+        :set s ""
+      } else={
+        :set line [:pick $s 0 $n]
+        :set s [:pick $s ($n + 1) [:len $s]]
+      }
+      :if ([:len $line] > 0) do={
+        :if ([:pick $line ([:len $line] - 1)] = "\r") do={ :set line [:pick $line 0 ([:len $line] - 1)] }
+      }
+      :if ([:len $line] > 0) do={
+        :if ([:pick $line 0] != "#") do={ :set out ($out, $line) }
+      }
+    }
+    :return $out
+  }
+
+  :local ok true
+
+  # ---- fetch BOTH before applying EITHER -------------------------------
+  # Deliberately not two independent halves. A run that updated addresses and
+  # then failed on keys would leave the device in a state no config file
+  # describes, which is the state that's hardest to reason about at 3am.
+  :local pfxRaw ""
+  :local keyRaw ""
+  :do {
+    :set pfxRaw ([/tool/fetch url=$pfxUrl mode=https check-certificate=yes output=user as-value]->"data")
+  } on-error={
+    :log warning "mgmt-refresh: prefix fetch FAILED - nothing changed"
+    :set ok false
+  }
+  :do {
+    :set keyRaw ([/tool/fetch url=$keyUrl mode=https check-certificate=yes output=user as-value]->"data")
+  } on-error={
+    :log warning "mgmt-refresh: key fetch FAILED - nothing changed"
+    :set ok false
+  }
+
+  :local pfx [:toarray ""]
+  :local keys [:toarray ""]
+  :if ($ok) do={
+    :set pfx  [$parse $pfxRaw]
+    :set keys [$parse $keyRaw]
+
+    # GUARD 2: empty is a failure, not an instruction to remove everything.
+    :if ([:len $pfx] = 0) do={
+      :log warning "mgmt-refresh: prefix endpoint returned 0 entries - nothing changed"
+      :set ok false
+    }
+    :if ([:len $keys] = 0) do={
+      :log warning "mgmt-refresh: key endpoint returned 0 entries - nothing changed"
+      :set ok false
+    }
+  }
+
+  # GUARD 2b: every prefix must be <ip>/<len>. One bad line fails the whole
+  # run: a partially-applied ACL is worse than a stale one.
+  :if ($ok) do={
+    :foreach p in=$pfx do={
+      :local slash [:find $p "/"]
+      :if ([:typeof $slash] = "nil") do={
+        :log warning ("mgmt-refresh: malformed prefix '$p' - nothing changed")
+        :set ok false
+      } else={
+        :if ([:typeof [:toip [:pick $p 0 $slash]]] != "ip") do={
+          :log warning ("mgmt-refresh: malformed prefix '$p' - nothing changed")
+          :set ok false
+        }
+      }
+    }
+  }
+
+  :if ($ok) do={
+    # ---- address-list: ADD new, THEN prune stale mgmt-dynamic ----------
+    :foreach p in=$pfx do={
+      :if ([:len [/ip/firewall/address-list/find where list=mgmt address=$p]] = 0) do={
+        /ip/firewall/address-list/add list=mgmt address=$p comment="mgmt-dynamic"
+        :log info ("mgmt-refresh: +$p")
+      }
+    }
+    # comment="mgmt-dynamic" ONLY. mgmt-static is the committed floor and is
+    # not ours to remove: see GUARD 4 above.
+    :foreach e in=[/ip/firewall/address-list/find where list=mgmt comment="mgmt-dynamic"] do={
+      :local a [/ip/firewall/address-list/get $e address]
+      :if ([:typeof [:find $pfx $a]] = "nil") do={
+        /ip/firewall/address-list/remove $e
+        :log info ("mgmt-refresh: -$a")
+      }
+    }
+
+    # ---- service ACL: floor FIRST, then the fetched set ----------------
+    # Rebuilt from $floor every run, so a hand-edit or a previous bad state is
+    # corrected rather than inherited. Never written empty: $floor is a
+    # non-empty literal, so the length check below can only fail if the build
+    # itself was broken.
+    :local svc ""
+    :foreach p in=$floor do={
+      :if ([:len $svc] > 0) do={ :set svc ($svc . ",") }
+      :set svc ($svc . $p)
+    }
+    :foreach p in=$pfx do={
+      :if ([:typeof [:find $floor $p]] = "nil") do={
+        :if ([:len $svc] > 0) do={ :set svc ($svc . ",") }
+        :set svc ($svc . $p)
+      }
+    }
+    # Change-detected against a global rather than by reading the service back:
+    # RouterOS returns a multi-entry `address` as a list, and string-comparing
+    # it would mismatch on every run and rewrite the ACL hourly. The global is
+    # lost on reboot, so the first run after a boot re-applies. Which is the
+    # right way round.
+    :global mrSvcAcl
+    :if (([:len $svc] > 0) && ($svc != $mrSvcAcl)) do={
+      # `!dynamic` is required as of RouterOS 7.19: /ip/service stopped
+      # being the eight static services and became a view over every listening
+      # TCP/UDP port on the box (live sessions, container ports, the winbox
+      # and ssh listeners themselves) as D-flagged rows that share the NAME
+      # of the real service. A bare [find name=winbox] therefore matches the
+      # static service AND a dynamic row, and `set` on a dynamic row fails
+      # with "this is configured elsewhere". Read the id in that message with
+      # suspicion: it's resolved against the static table, so it prints the
+      # name of a service you never touched (telnet, for a low id).
+      #
+      # The on-error isn't belt-and-braces. An uncaught failure here aborts
+      # the whole script mid-run, which put the abort BETWEEN the address-list
+      # update and the SSH key refresh below: addresses current, keys never
+      # refreshed, and nothing in the log saying so. A stale ACL is worth a
+      # loud log and carrying on; it's not worth silently killing the half of
+      # this script that maintains your ability to log in.
+      #
+      # $mrSvcAcl is set ONLY on success, so a failed run retries next tick
+      # instead of caching a value it never actually applied.
+      :local svcOk true
+      :do {
+        /ip/service/set [find where !dynamic name="ssh"] address=$svc
+        /ip/service/set [find where !dynamic name="winbox"] address=$svc
+      } on-error={
+        :set svcOk false
+        :log error ("mgmt-refresh: service ACL set FAILED - address-list is current, ACL is STALE, keys still refreshed")
+      }
+      :if ($svcOk) do={
+        :set mrSvcAcl $svc
+        :log warning ("mgmt-refresh: service ACL -> $svc")
+      }
+    }
+
+    # ---- SSH keys: import ALL, VERIFY, only then remove the old ones ----
+    # $oldIds is captured BEFORE the import so the two sets never overlap.
+    # The count check between them is what makes this safe: if the import
+    # silently dropped keys, the old set survives and you keep your access.
+    :local sig ""
+    :foreach k in=$keys do={ :set sig ($sig . $k) }
+    :global mrKeySig
+    :if ($sig != $mrKeySig) do={
+      :local oldIds [/user/ssh-keys/find user=$user]
+      :local before [:len $oldIds]
+      :local i 0
+      :foreach k in=$keys do={
+        :set i ($i + 1)
+        :do {
+          /file/add name="mr-key.pub" contents=$k
+          /user/ssh-keys/import user=$user public-key-file="mr-key.pub"
+          /file/remove [find name="mr-key.pub"]
+        } on-error={
+          :log warning ("mgmt-refresh: key $i rejected by import")
+        }
+      }
+      :local after [:len [/user/ssh-keys/find user=$user]]
+      :if (($after - $before) = [:len $keys]) do={
+        :foreach id in=$oldIds do={ /user/ssh-keys/remove $id }
+        :set mrKeySig $sig
+        :log warning ("mgmt-refresh: ssh keys -> " . [:len $keys] . " key(s) for $user")
+      } else={
+        # Fewer keys landed than we fetched. Do NOT remove the old set; leave
+        # the router holding both and shout about it. Duplicates are harmless,
+        # an empty authorized_keys isn't.
+        :log error ("mgmt-refresh: imported " . ($after - $before) . " of " . [:len $keys] . " keys - OLD KEYS KEPT, fix the endpoint")
+      }
+    }
+  }
+}
+
+{% if t.mgmt_refresh.enabled %}
+# Armed. Verify by hand on ONE router before trusting the fleet:
+#   /system/script/run mgmt-refresh
+#   /log/print where message~"mgmt-refresh"
+#   /ip/service/print detail where name=ssh
+/system/scheduler add name=mgmt-refresh interval={{ t.mgmt_refresh.interval }} on-event=mgmt-refresh policy=read,write,test,policy
+{% else %}
+# NOT ARMED (mgmt_refresh.enabled: false in topology.yml). The script above is
+# installed and runnable by hand; nothing runs unattended until you flip the
+# flag and redeploy. Dry-run it first:
+#   /system/script/run mgmt-refresh
+#   /log/print where message~"mgmt-refresh"
+# /system/scheduler add name=mgmt-refresh interval={{ t.mgmt_refresh.interval }} on-event=mgmt-refresh policy=read,write,test,policy
+{% endif %}
+{% endif %}

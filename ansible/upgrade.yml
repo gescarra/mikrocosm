@@ -1,0 +1,698 @@
+# =====================================================================
+#  upgrade.yml. Take every router to the latest RouterOS on its channel,
+#  one at a time, behind a manual gate, with a health check on both sides
+#  of the reboot.
+#
+#  This is NOT deploy.yml. Nothing here touches the config: no reset, no
+#  run-after-reset, no .rsc upload. The config, the files on the router
+#  (including deploy.yml's <fqdn>.applied fingerprint), and the licence all
+#  survive a package upgrade. Deploy and upgrade are independent axes and
+#  can be run in either order.
+#
+#  The flow, per router:
+#
+#      snapshot health  ->  check-for-updates  ->  backup  ->  GATE
+#        ->  download (no reboot yet)  ->  reboot  ->  verify version
+#        ->  [RouterBOARD only] firmware upgrade + reboot
+#        ->  wait for BGP/OSPF to come back to the snapshot
+#
+#  DOWNLOAD AND REBOOT ARE DELIBERATELY SEPARATE STEPS. `/system/package/
+#  update install` does both in one shot, which means a download that fails
+#  or stalls has already cost you the router's uptime. Downloading first
+#  leaves the box fully in service if anything goes wrong; the reboot only
+#  happens once the .npk is on disk.
+#  A router stuck halfway through a download is an expensive paperweight with
+#  blinking lights.
+#
+#  ORDER IS THE SAME AS deploy.yml AND FOR THE SAME REASON: br1 -> er1 ->
+#  br2 -> er2, alternating border/edge, so one BR and one ER are always up
+#  and the /24 anchor and the /25 are never both dark. serial:1 +
+#  order:inventory preserve it.
+#
+#  >>> The routers must be able to reach upgrade.mikrotik.com (DNS + HTTPS
+#  >>> outbound). A BR whose only default route is BGP-learned still has
+#  >>> one; an ER reaches it through the tunnels. If check-for-updates
+#  >>> hangs, that's what to look at first.
+#
+#  Usage:
+#    ansible-playbook upgrade.yml --check              # report only, changes nothing
+#    ansible-playbook upgrade.yml                      # upgrade whatever is behind
+#    ansible-playbook upgrade.yml -e channel=stable    # also switch channel first
+#    ansible-playbook upgrade.yml -e allow_major=true  # permit a v7 -> v8 jump
+#    ansible-playbook upgrade.yml -e skip=er1.hdc      # leave named routers alone
+#    ansible-playbook upgrade.yml --limit br1.ord1     # or run just one
+# =====================================================================
+- name: Upgrade RouterOS one router at a time
+  hosts: routers
+  gather_facts: false
+  connection: local
+  serial: 1            # one router at a time
+  order: inventory     # keep the deliberate br1 -> er1 -> br2 -> er2 order
+  any_errors_fatal: true
+
+  vars:
+    skip: ""                  # -e skip=a,b        -> leave these routers alone
+    skip_list: "{{ (skip | string).split(',') | map('trim') | reject('equalto', '') | list }}"
+
+    # Empty means LEAVE THE ROUTER'S CHANNEL ALONE, which is the right default:
+    # switching channels is a decision, not a side effect of asking for updates.
+    # Set it (stable / long-term / testing / development) to switch first.
+    channel: ""
+
+    # A major-version jump isn't a routine upgrade. RouterOS reorganises
+    # configuration between majors, and this repo's own README already warns
+    # that routing-filter matcher names drift between releases. The
+    # `ebgp-out` chains in br.rsc.j2 are written against the ROS7 rule
+    # language. So a v7 -> v8 upgrade can leave the box up, reachable, and
+    # silently not filtering. Refuse it unless asked, and refuse it on the
+    # FIRST router, before anything has been touched.
+    allow_major: false
+
+    # RouterBOOT firmware, on physical RouterBOARDs only. CHRs have no
+    # routerboard and are skipped automatically. This flag isn't what
+    # decides that, the hardware is.
+    upgrade_firmware: true
+
+    # An .npk needs room. CHR images run ~20 MB; the check is a floor, not a
+    # measurement of the specific package.
+    min_free_bytes: 25000000
+
+    fetch_backups: true       # pull the pre-upgrade backup + export to out/backups/
+    backup_dir: "{{ out_dir }}/backups"
+
+    # Convergence budget AFTER the box is back on SSH. BGP has to re-establish
+    # every session and re-learn everything; on the ERs that includes the eBGP
+    # sessions with the firewalls. 20 x 15s = 5 minutes.
+    converge_retries: 20
+    converge_delay: 15
+
+    ssh_base: "{{ ['ssh', '-p', ssh_port | string] + ros_ssh_opts + [router_user ~ '@' ~ router_address] }}"
+
+    # One SSH round trip, seven counters, comma separated. Order is fixed and
+    # parsed positionally below:
+    #   bgp_established, bgp_total, ospf_full, routes4, routes6, bh4, bh6
+    #
+    # The blackhole counts are the anchors (see the "origination anchor" block
+    # in both templates). Counting them role-agnostically (rather than
+    # matching on 203.0.113.0/24) means this works unchanged on a BR, on an
+    # ER, and on whatever gets added to topology.yml later. Disabled anchors
+    # still count: the anchor-guard script legitimately disables them, so this
+    # asks "did the route object survive the upgrade", not "is it active".
+    snapshot_cmd: >-
+      :put ([:tostr [:len [/routing/bgp/session find where established]]] . ","
+      . [:tostr [:len [/routing/bgp/session find]]] . ","
+      . [:tostr [:len [/routing/ospf/neighbor find where state="Full"]]] . ","
+      . [:tostr [:len [/ip/route find where active]]] . ","
+      . [:tostr [:len [/ipv6/route find where active]]] . ","
+      . [:tostr [:len [/ip/route find where blackhole]]] . ","
+      . [:tostr [:len [/ipv6/route find where blackhole]]])
+
+  tasks:
+    # ---- MANUAL SKIP -------------------------------------------------
+    - name: "Skip | router named in 'skip' var — do nothing"
+      ansible.builtin.debug:
+        msg: "SKIP {{ inventory_hostname }} — excluded by skip='{{ skip }}'."
+      when: inventory_hostname in skip_list
+
+    - name: "Skip | end play for manually-skipped router"
+      ansible.builtin.meta: end_host
+      when: inventory_hostname in skip_list
+
+    # ---- PREFLIGHT ---------------------------------------------------
+    # NO HOST VARIABLES IN `name:`. See the long note in deploy.yml. A task
+    # name is templated once, by the first host to reach it, and reused as the
+    # banner for every host after. Identity goes in `msg:`/`prompt:`.
+    - name: "Preflight | router answers SSH right now"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: started
+        timeout: 15
+      # Times out here? Same cause as in deploy.yml: SSH is source-filtered to
+      # mgmt_prefixes (today 203.0.113.0/24) in both templates. Run this from
+      # the home site or every connection times out.
+
+    - name: "Preflight | identity, version, channel, free space"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put ([/system/identity/get name] . \",\" . [/system/package/update/get installed-version] . \",\" . [/system/package/update/get channel] . \",\" . [:tostr [/system/resource/get free-hdd-space]])'] }}"
+      register: pre_facts
+      changed_when: false
+      check_mode: false
+      retries: 3
+      delay: 5
+      until: pre_facts.rc == 0
+
+    - name: "Preflight | parse"
+      ansible.builtin.set_fact:
+        f: "{{ pre_facts.stdout | trim | split(',') }}"
+
+    - name: "Preflight | name the facts"
+      ansible.builtin.set_fact:
+        ros_identity: "{{ f[0] | trim }}"
+        ros_installed: "{{ f[1] | trim }}"
+        ros_channel: "{{ f[2] | trim }}"
+        ros_free: "{{ f[3] | trim | int }}"
+
+    # Deliberately its own best-effort task rather than another field in the
+    # command above. `/system/routerboard` is a hardware menu; a CHR answers
+    # `false`, but if a given image doesn't expose the menu at all the read
+    # errors: and folding that into the mandatory preflight would abort the
+    # whole rollout on a CHR for a fact that only gates the firmware step.
+    # No answer is treated as "not a RouterBOARD", which is correct for br1/br2.
+    - name: "Preflight | is this physical hardware (RouterBOARD) or a CHR?"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put [:tostr [/system/routerboard/get routerboard]]'] }}"
+      register: rb_probe
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: "Preflight | record hardware type"
+      ansible.builtin.set_fact:
+        is_routerboard: "{{ rb_probe.rc == 0 and (rb_probe.stdout | trim | lower) == 'true' }}"
+
+    - name: "Preflight | we are talking to the router we think we are"
+      ansible.builtin.assert:
+        that: ros_identity == inventory_hostname
+        fail_msg: >-
+          {{ router_address }} identifies as '{{ ros_identity }}', not
+          '{{ inventory_hostname }}'. Fix the inventory before upgrading anything.
+        success_msg: "{{ inventory_hostname }}: RouterOS {{ ros_installed }} ({{ ros_channel }} channel)"
+
+    - name: "Preflight | enough free space for the .npk"
+      ansible.builtin.assert:
+        that: ros_free | int > min_free_bytes | int
+        fail_msg: >-
+          {{ inventory_hostname }} has only {{ (ros_free | int / 1048576) | round(1) }} MiB free —
+          not enough for the package. Clear old files first:
+          /file print   (old backups, exports and .npk files from previous upgrades live here)
+        success_msg: "{{ (ros_free | int / 1048576) | round(1) }} MiB free — enough for the package."
+
+    # ---- HEALTH SNAPSHOT (the "before" side of the comparison) --------
+    # Everything asserted after the reboot is asserted RELATIVE TO THIS, never
+    # against a hardcoded expectation. Two reasons: the numbers change as
+    # topology.yml grows, and a session that was already down before the
+    # upgrade must not be blamed on the upgrade. The bar is "no worse than
+    # when we started", which is the only thing an upgrade can be held to.
+    - name: "Health | snapshot before the upgrade"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [snapshot_cmd] }}"
+      register: pre_health
+      changed_when: false
+      check_mode: false
+      # No failed_when override: if this errors, the RouterOS paths below have
+      # moved and the whole run should stop HERE, on the first router, before
+      # anything has been changed. That's the cheap place to find out.
+
+    - name: "Health | parse the snapshot"
+      ansible.builtin.set_fact:
+        h0: "{{ pre_health.stdout | trim | split(',') | map('trim') | map('int') | list }}"
+
+    - name: "Health | before"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} BEFORE —
+          BGP established {{ h0[0] }}/{{ h0[1] }},
+          OSPF Full {{ h0[2] }},
+          active routes v4 {{ h0[3] }} / v6 {{ h0[4] }},
+          anchors v4 {{ h0[5] }} / v6 {{ h0[6] }}
+
+    # ---- WHAT IS AVAILABLE -------------------------------------------
+    - name: "Update | switch channel first (only when channel is set)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/system/package/update/set channel=' ~ channel] }}"
+      changed_when: true
+      when: channel | length > 0
+
+    - name: "Update | ask MikroTik what the latest version is"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/system/package/update/check-for-updates once'] }}"
+      register: check_cmd
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      # `once` makes it run and return rather than staying interactive. rc is
+      # not the signal: the status read below is.
+
+    - name: "Update | read status + latest-version (retry while the check runs)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put ([/system/package/update/get status] . \"|\" . [/system/package/update/get latest-version])'] }}"
+      register: upd
+      changed_when: false
+      check_mode: false
+      retries: 12
+      delay: 5
+      until: >-
+        upd.rc == 0
+        and (upd.stdout | trim | split('|') | last | trim) | length > 0
+        and 'finding' not in (upd.stdout | lower)
+
+    - name: "Update | parse"
+      ansible.builtin.set_fact:
+        upd_status: "{{ upd.stdout | trim | split('|') | first | trim }}"
+        ros_latest: "{{ upd.stdout | trim | split('|') | last | trim }}"
+
+    - name: "Update | the check itself did not error"
+      ansible.builtin.assert:
+        that:
+          - "'error' not in upd_status | lower"
+          - ros_latest | length > 0
+        fail_msg: >-
+          {{ inventory_hostname }}: could not determine the latest version
+          (status: '{{ upd_status }}'). The router needs DNS and outbound HTTPS to
+          upgrade.mikrotik.com. Check on the router:
+          /system/package/update check-for-updates ; /ip/dns print
+        success_msg: "{{ inventory_hostname }}: installed {{ ros_installed }}, latest {{ ros_latest }} ({{ upd_status }})"
+
+    # ---- FIRMWARE (RouterBOARD only) ---------------------------------
+    - name: "Firmware | current vs available RouterBOOT"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put ([/system/routerboard/get current-firmware] . \"|\" . [/system/routerboard/get upgrade-firmware])'] }}"
+      register: fw
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      when: is_routerboard | bool
+
+    - name: "Firmware | decide"
+      ansible.builtin.set_fact:
+        fw_current: "{{ (fw.stdout | trim | split('|') | first | trim) if (is_routerboard | bool and fw.rc == 0) else '' }}"
+        fw_available: "{{ (fw.stdout | trim | split('|') | last | trim) if (is_routerboard | bool and fw.rc == 0) else '' }}"
+
+    # ---- DECIDE ------------------------------------------------------
+    - name: "Decide | is there anything to do"
+      ansible.builtin.set_fact:
+        ros_needed: "{{ ros_installed != ros_latest }}"
+        fw_needed: >-
+          {{ (upgrade_firmware | bool)
+             and (is_routerboard | bool)
+             and fw_current | length > 0
+             and fw_current != fw_available }}
+
+    # The major-version guard. Deliberately an assert and not a skip: you asked
+    # for the latest, and quietly declining to deliver it on one router while
+    # upgrading the others is the worst of both worlds. Failing stops the whole
+    # rollout (any_errors_fatal) on the first router, before any change.
+    - name: "Decide | refuse a major-version jump unless explicitly allowed"
+      ansible.builtin.assert:
+        that: (ros_installed.split('.')[0] | int) == (ros_latest.split('.')[0] | int)
+        fail_msg: >-
+          {{ inventory_hostname }}: {{ ros_installed }} -> {{ ros_latest }} crosses a MAJOR
+          version boundary. RouterOS reorganises configuration between majors, and this
+          repo's routing filters (the ebgp-out chains in br.rsc.j2) are written against the
+          ROS7 rule language — matcher names drift between releases, and a box that comes
+          back up with silently non-functional filters looks healthy. Read the release notes,
+          test on ONE border router, verify the anchor-guard test in the repo README, then
+          re-run with -e allow_major=true.
+        success_msg: "{{ ros_installed }} -> {{ ros_latest }} is within the same major version."
+      when: ros_needed | bool and not (allow_major | bool)
+
+    - name: "Decide | status"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          RouterOS {{ 'UPGRADE ' ~ ros_installed ~ ' -> ' ~ ros_latest if ros_needed | bool
+                      else 'up to date (' ~ ros_installed ~ ')' }};
+          firmware {{ ('UPGRADE ' ~ fw_current ~ ' -> ' ~ fw_available) if fw_needed | bool
+                       else ('up to date (' ~ fw_current ~ ')' if is_routerboard | bool
+                             else 'n/a — CHR, no routerboard') }}
+
+    - name: "Decide | nothing to do — leave this router alone (no reboot)"
+      ansible.builtin.meta: end_host
+      when: not (ros_needed | bool) and not (fw_needed | bool)
+
+    - name: "Check mode | report only, change nothing"
+      ansible.builtin.meta: end_host
+      when: ansible_check_mode
+
+    # ---- BACKUP ------------------------------------------------------
+    # Cheap insurance taken BEFORE the gate so the operator can see it
+    # succeeded before committing. Two artefacts because they do different
+    # jobs: the .backup is a binary restore of this exact box, the .rsc export
+    # is readable and diffable against out/<fqdn>.rsc.
+    #
+    # >>> The .backup contains the WireGuard PRIVATE KEYS. out/ is gitignored
+    # >>> for exactly this reason. Keep it that way, and treat the fetched
+    # >>> files as secret material.
+    - name: "Backup | save a binary backup + a readable export on the router"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/system/backup/save name=' ~ backup_stem ~ ' dont-encrypt=yes ; /export file=' ~ backup_stem] }}"
+      vars:
+        backup_stem: "pre-upgrade-{{ ros_installed }}"
+      register: backup_cmd
+      changed_when: true
+      failed_when: false
+
+    - name: "Backup | local directory to fetch into"
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+      when: fetch_backups | bool
+
+    - name: "Backup | fetch both to {{ backup_dir }}/"
+      ansible.builtin.command:
+        argv: "{{ ['scp', '-O', '-P', ssh_port | string] + ros_ssh_opts + [router_user ~ '@' ~ router_address ~ ':pre-upgrade-' ~ ros_installed ~ item, backup_dir ~ '/' ~ inventory_hostname ~ '-pre-' ~ ros_installed ~ item] }}"
+      loop: [".backup", ".rsc"]
+      register: backup_fetch
+      changed_when: true
+      failed_when: false
+      when: fetch_backups | bool
+
+    - name: "Backup | warn if it did not land"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: the pre-upgrade backup for {{ inventory_hostname }} did not save or
+          fetch cleanly. You are about to upgrade with no local rollback artefact.
+          Abort at the gate if you care.
+      when: backup_cmd.rc != 0 or (fetch_backups | bool and (backup_fetch.results | selectattr('rc', 'ne', 0) | list | length) > 0)
+
+    # ---- MANUAL CONFIRMATION GATE ------------------------------------
+    # Identity lives in the prompt body below, which IS templated per host.
+    - name: "GATE | confirm before upgrading this router"
+      ansible.builtin.pause:
+        prompt: |
+
+          ============================================================
+           UPGRADE  {{ inventory_hostname }}  ({{ router_address }})
+          ============================================================
+            RouterOS : {{ ros_installed }} -> {{ ros_latest }}{{ '   (already current)' if not ros_needed | bool else '' }}
+            Channel  : {{ ros_channel }}
+            Firmware : {{ (fw_current ~ ' -> ' ~ fw_available) if fw_needed | bool
+                          else (fw_current if is_routerboard | bool else 'n/a — CHR') }}
+
+            Health now: BGP {{ h0[0] }}/{{ h0[1] }} established, OSPF {{ h0[2] }} Full,
+                        routes v4 {{ h0[3] }} / v6 {{ h0[4] }},
+                        anchors v4 {{ h0[5] }} / v6 {{ h0[6] }}
+
+          The package is downloaded FIRST — the router stays in service for
+          that part. It then REBOOTS{{ ' TWICE (RouterOS, then RouterBOOT firmware)' if fw_needed | bool else '' }} and drops
+          every session on it.
+
+          Unlike deploy.yml this does not touch the config, so a failed
+          upgrade leaves the box on its old version rather than unconfigured.
+          Have the provider console open anyway.
+
+          Confirm the PREVIOUS router fully reconverged before continuing.
+
+          ENTER = proceed   |   Ctrl-C then A = abort the whole rollout
+          ============================================================
+
+    # ---- DOWNLOAD: no reboot, router stays in service ---------------
+    - name: "Download | fetch the .npk (router stays up)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/system/package/update/download'] }}"
+      register: dl_cmd
+      changed_when: true
+      failed_when: false
+      when: ros_needed | bool
+
+    - name: "Download | wait for the package to be on disk"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put [/system/package/update/get status]'] }}"
+      register: dl_status
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: >-
+        dl_status.rc == 0
+        and ('reboot' in (dl_status.stdout | lower)
+             or 'error' in (dl_status.stdout | lower))
+      failed_when: false
+      when: ros_needed | bool
+
+    - name: "Download | it actually downloaded"
+      ansible.builtin.assert:
+        that: "'reboot' in (dl_status.stdout | default('') | lower)"
+        fail_msg: >-
+          {{ inventory_hostname }}: download did not complete (status:
+          '{{ dl_status.stdout | default('') | trim }}'). NOTHING HAS BEEN CHANGED — the
+          router is still running {{ ros_installed }} and is still in service. Check
+          connectivity to upgrade.mikrotik.com and free space, then re-run.
+        success_msg: "{{ inventory_hostname }}: {{ ros_latest }} downloaded and staged."
+      when: ros_needed | bool
+
+    # ---- REBOOT: this is where the version actually changes ----------
+    - name: "Reboot | apply the package (link drops here)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/system/reboot'] }}"
+      register: reboot_cmd
+      changed_when: true
+      failed_when: false
+      when: ros_needed | bool
+      # The session dies with the box, so a non-zero rc is EXPECTED. The
+      # down -> up -> version checks below are the real proof.
+
+    # Any router that got this far has rebooted onto a new package, and
+    # RouterOS resets SNMPv3 engineBoots when it does. zabbix-snmp-reload.yml
+    # (imported at the end) keys off this to flush Zabbix's engine cache.
+    - name: "Reboot | flag the SNMPv3 engine reset for Zabbix"
+      ansible.builtin.set_fact:
+        npk_installed: true
+      when: ros_needed | bool
+
+    - name: "Reboot | SSH goes DOWN (the reboot actually started)"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: stopped
+        timeout: "{{ down_timeout }}"
+      when: ros_needed | bool
+      # Never goes down? The package was staged but not applied. Do NOT assume
+      # it upgraded: check via console.
+
+    - name: "Reboot | SSH comes BACK"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: started
+        delay: 15
+        timeout: "{{ up_timeout }}"
+      when: ros_needed | bool
+
+    - name: "Verify | read version + identity back (retries while SSH settles)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put ([/system/package/update/get installed-version] . \"|\" . [/system/identity/get name])'] }}"
+      register: post_ver
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: post_ver.rc == 0
+      when: ros_needed | bool
+
+    - name: "Verify | the upgrade took"
+      ansible.builtin.assert:
+        that:
+          - (post_ver.stdout | trim | split('|') | first | trim) == ros_latest
+          - (post_ver.stdout | trim | split('|') | last | trim) == inventory_hostname
+        fail_msg: >-
+          {{ inventory_hostname }} came back as
+          '{{ post_ver.stdout | trim }}' — expected {{ ros_latest }}|{{ inventory_hostname }}.
+          The package did not apply. Check /log print on the router before continuing.
+        success_msg: "{{ inventory_hostname }} is now on RouterOS {{ ros_latest }}."
+      when: ros_needed | bool
+
+    # ---- ROUTERBOOT FIRMWARE (physical hardware only) ----------------
+    # Re-read after the RouterOS upgrade: the new package usually ships a new
+    # RouterBOOT, so the pre-upgrade answer is stale by now. CHRs never get here.
+    - name: "Firmware | re-read available RouterBOOT after the RouterOS upgrade"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put ([/system/routerboard/get current-firmware] . \"|\" . [/system/routerboard/get upgrade-firmware])'] }}"
+      register: fw2
+      changed_when: false
+      failed_when: false
+      when: upgrade_firmware | bool and is_routerboard | bool
+
+    - name: "Firmware | decide again"
+      ansible.builtin.set_fact:
+        fw_needed_now: >-
+          {{ (upgrade_firmware | bool) and (is_routerboard | bool)
+             and fw2.rc | default(1) == 0
+             and (fw2.stdout | trim | split('|') | first | trim)
+                 != (fw2.stdout | trim | split('|') | last | trim) }}
+
+    - name: "Firmware | write the new RouterBOOT"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/system/routerboard/upgrade'] }}"
+      register: fw_upg
+      changed_when: true
+      failed_when: false
+      when: fw_needed_now | bool
+
+    - name: "Firmware | reboot so RouterBOOT takes effect (link drops again)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + ['/system/reboot'] }}"
+      changed_when: true
+      failed_when: false
+      when: fw_needed_now | bool
+
+    - name: "Firmware | SSH goes DOWN"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: stopped
+        timeout: "{{ down_timeout }}"
+      when: fw_needed_now | bool
+
+    - name: "Firmware | SSH comes BACK"
+      ansible.builtin.wait_for:
+        host: "{{ router_address }}"
+        port: "{{ ssh_port }}"
+        state: started
+        delay: 15
+        timeout: "{{ up_timeout }}"
+      when: fw_needed_now | bool
+
+    - name: "Firmware | confirm RouterBOOT is now current"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put ([/system/routerboard/get current-firmware] . \"|\" . [/system/routerboard/get upgrade-firmware])'] }}"
+      register: fw3
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: fw3.rc == 0
+      when: fw_needed_now | bool
+
+    - name: "Firmware | report"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} RouterBOOT now
+          {{ fw3.stdout | trim | split('|') | first | trim }}
+          {{ '(still behind ' ~ (fw3.stdout | trim | split('|') | last | trim) ~ ' — check /log)'
+             if (fw3.stdout | trim | split('|') | first | trim) != (fw3.stdout | trim | split('|') | last | trim)
+             else '— current.' }}
+      when: fw_needed_now | bool
+
+    # ---- HEALTH: the "after" side, compared to the snapshot -----------
+    # This is the part deploy.yml deliberately leaves to you, and the reason it
+    # can be automated here is the snapshot: there's a concrete "before" to be
+    # no worse than. Retried, because BGP doesn't come back instantly. The
+    # ERs have to re-establish eBGP with the firewalls before the /25 anchor is
+    # re-enabled and the BRs will re-originate the /24.
+    - name: "Health | wait for BGP + OSPF to come back to where they were"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [snapshot_cmd] }}"
+      register: post_health
+      changed_when: false
+      retries: "{{ converge_retries }}"
+      delay: "{{ converge_delay }}"
+      until: >-
+        post_health.rc == 0
+        and (post_health.stdout | trim | split(',') | map('trim') | map('int') | list)[0] >= h0[0] | int
+        and (post_health.stdout | trim | split(',') | map('trim') | map('int') | list)[2] >= h0[2] | int
+      failed_when: false
+
+    # Padded to 7 so a router that never answered produces all-zeros and fails
+    # the assertion below with a readable message, rather than an index error
+    # in a template three tasks later.
+    - name: "Health | parse the post-upgrade snapshot"
+      ansible.builtin.set_fact:
+        h1: "{{ ((post_health.stdout | default('') | trim | split(',') | map('trim') | map('int') | list) + [0, 0, 0, 0, 0, 0, 0])[:7] }}"
+
+    - name: "Health | after"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} AFTER —
+          BGP established {{ h1[0] }}/{{ h1[1] }} (was {{ h0[0] }}/{{ h0[1] }}),
+          OSPF Full {{ h1[2] }} (was {{ h0[2] }}),
+          active routes v4 {{ h1[3] }} / v6 {{ h1[4] }} (was {{ h0[3] }} / {{ h0[4] }}),
+          anchors v4 {{ h1[5] }} / v6 {{ h1[6] }} (was {{ h0[5] }} / {{ h0[6] }})
+
+    - name: "Health | the router is no worse off than before the upgrade"
+      ansible.builtin.assert:
+        that:
+          - h1[0] | int >= h0[0] | int      # BGP sessions established
+          - h1[2] | int >= h0[2] | int      # OSPF neighbours Full
+          - h1[5] | int >= h0[5] | int      # v4 anchors survived
+          - h1[6] | int >= h0[6] | int      # v6 anchors survived
+        fail_msg: >-
+          {{ inventory_hostname }} did NOT reconverge after the upgrade:
+          BGP {{ h1[0] }} vs {{ h0[0] }}, OSPF Full {{ h1[2] }} vs {{ h0[2] }},
+          anchors v4 {{ h1[5] }} vs {{ h0[5] }}, v6 {{ h1[6] }} vs {{ h0[6] }}.
+          STOP — do not release the next gate. On the router:
+          /routing/bgp/session print ; /routing/ospf/neighbor print ; /log print
+          A version change that breaks routing-filter syntax looks exactly like this.
+        success_msg: "{{ inventory_hostname }}: BGP and OSPF are back to their pre-upgrade state."
+
+    # Route counts move on their own (an upstream can withdraw something while
+    # we reboot) so this is a WARNING, not an assertion. A big drop is still
+    # worth a human look before the next gate.
+    - name: "Health | warn on a significant drop in active routes"
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: active routes on {{ inventory_hostname }} dropped from
+          {{ h0[3] }}/{{ h0[4] }} to {{ h1[3] }}/{{ h1[4] }} (v4/v6). Not necessarily wrong —
+          upstreams churn — but check /ip/route print before releasing the next gate.
+      when: (h1[3] | int) < (h0[3] | int * 0.9) or (h1[4] | int) < (h0[4] | int * 0.9)
+
+    # BFD is best-effort on purpose: it's additive under OSPF (topology.yml),
+    # so a missing session degrades convergence speed rather than connectivity,
+    # and it shouldn't fail a rollout that's otherwise healthy. But
+    # use-bfd=yes with sessions that never come up is precisely the state the
+    # two-pass rollout in topology.yml exists to avoid, so it gets reported.
+    - name: "Health | BFD sessions (informational)"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put ([:tostr [:len [/routing/bfd/session find]]] . \"|\" . [:tostr [:len [/routing/bfd/session find where state=\"up\"]]])'] }}"
+      register: bfd
+      changed_when: false
+      failed_when: false
+
+    - name: "Health | BFD report"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} BFD:
+          {{ (bfd.stdout | trim | split('|') | last | trim ~ ' up of '
+              ~ (bfd.stdout | trim | split('|') | first | trim) ~ ' sessions')
+             if bfd.rc == 0 else 'could not be read (rc=' ~ bfd.rc ~ ') — check manually' }}
+
+    - name: "Done"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: RouterOS {{ ros_latest }}{{ ', RouterBOOT refreshed' if fw_needed_now | bool else '' }}.
+          BGP and OSPF verified against the pre-upgrade snapshot. Give it a look
+          yourself — the /24 anchor, the /25, and the eBGP sessions with the
+          firewalls — before releasing the next gate.
+
+# =====================================================================
+#  Final summary. Runs against every router in the inventory, including the
+#  ones the play above skipped, so the last thing printed is the actual fleet
+#  state rather than only what changed.
+# =====================================================================
+- name: Fleet version summary
+  hosts: routers
+  gather_facts: false
+  connection: local
+  any_errors_fatal: false
+
+  vars:
+    ssh_base: "{{ ['ssh', '-p', ssh_port | string] + ros_ssh_opts + [router_user ~ '@' ~ router_address] }}"
+
+  tasks:
+    - name: "Summary | read the running version"
+      ansible.builtin.command:
+        argv: "{{ ssh_base + [':put ([/system/package/update/get installed-version] . \"|\" . [/system/package/update/get channel] . \"|\" . [/system/package/update/get latest-version])'] }}"
+      register: final_ver
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: "Summary"
+      ansible.builtin.debug:
+        msg: >-
+          {{ '%-12s' | format(inventory_hostname) }}
+          {{ ('RouterOS ' ~ (final_ver.stdout | trim | split('|') | first | trim)
+              ~ '  channel ' ~ (final_ver.stdout | trim | split('|'))[1] | trim
+              ~ ('  <-- LATEST IS ' ~ (final_ver.stdout | trim | split('|') | last | trim)
+                 if (final_ver.stdout | trim | split('|') | first | trim)
+                    != (final_ver.stdout | trim | split('|') | last | trim) else '  (current)'))
+             if final_ver.rc == 0 else 'UNREACHABLE' }}
+
+# =====================================================================
+#  Flush Zabbix's SNMPv3 engine cache if any router rebooted onto a new
+#  package: RouterOS resets engineBoots on install and Zabbix would
+#  otherwise drop every reply. See zabbix-snmp-reload.yml.
+# =====================================================================
+- name: Zabbix SNMPv3 cache
+  ansible.builtin.import_playbook: zabbix-snmp-reload.yml
+  vars:
+    only_if_installed: true

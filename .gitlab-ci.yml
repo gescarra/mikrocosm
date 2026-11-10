@@ -1,0 +1,346 @@
+# =====================================================================
+#  AS64500: build, deploy, test.
+#
+#  This file is the PARENT pipeline: it validates, tests and renders, and then
+#  hands the rollout to a child pipeline that generate.py wrote from
+#  topology.yml. The split isn't cosmetic.
+#
+#    validate ─┐
+#    unit ─────┼─> build ──> trigger ──> [ child pipeline: the rollout ]
+#    lint ─────┘                              baseline
+#                                             deploy:br1 -> verify:br1
+#                                             deploy:er1 -> verify:er1
+#                                             deploy:br2 -> verify:br2
+#                                             deploy:er2 -> verify:er2
+#                                             e2e
+#                                             chaos (manual)
+#
+#  WHY THE ROLLOUT IS GENERATED. The alternating br->er order is the safety
+#  property. It keeps one border router and one edge router alive at every step, so the
+#  /24 anchor and the /25 are never both dark. Writing that job list by hand
+#  means a third border router silently lands at the end of the pipeline in the
+#  wrong place, and nothing complains. Deriving it from the same topology that
+#  renders the configs means the pipeline shape and the network shape can't
+#  disagree. See emit.py.
+#  Humans are great at networks and terrible at lists. Let the script do the list.
+#
+#  WHY THE GATE IS A `needs:` EDGE. Every deploy job needs the PREVIOUS
+#  router's verify job. A failing test doesn't "stop the script". The next
+#  deploy job never becomes eligible to run at all. There's no code path that
+#  skips it.
+#
+#  ---------------------------------------------------------------------
+#  WHAT THIS NEEDS FROM GITLAB
+#
+#    Runner    on-prem at hdc, docker executor, BEHIND the customer firewalls.
+#              Both halves matter. SSH to the routers is source-filtered to
+#              mgmt_prefixes, so an off-site runner can't reach them at all;
+#              and the end-to-end test works by making the runner's OWN traffic
+#              the traffic under test, which only proves anything if the runner
+#              is where the customers are.
+#
+#    KEYS_JSON        Type FILE, PROTECTED. The WireGuard keystore.
+#    SSH_PRIVATE_KEY  Type FILE, PROTECTED. Key for the automation user,
+#                     whose PUBLIC half is published at topology.yml's
+#                     ssh.keys_url and re-imported by every generated config.
+#
+#  Both must be PROTECTED and `main` must be a protected branch, or an MR from
+#  a fork would be handed the keys to the fleet.
+#
+#  NEITHER CAN BE "MASKED", and trying produces:
+#      Unable to create masked variable because:
+#      * The value can't contain the following characters: whitespace characters
+#  GitLab masks only single-line values, and a formatted JSON keystore and a PEM
+#  private key are both multi-line. Masking only ever redacted exact string
+#  matches in job output anyway; what replaces it here is that NO JOB PRINTS
+#  EITHER FILE: each is installed to disk, read by the tooling, and shredded
+#  in after_script. test_pipeline_yaml.py fails the build if a job starts
+#  echoing one.
+#
+#  ---------------------------------------------------------------------
+#  WHAT IS NOT HERE: ROLLBACK.
+#
+#  There's no automatic rollback and adding one would be a mistake. The apply
+#  path is reset-configuration + run-after-reset: rolling back means rendering
+#  an older commit and running the SAME destructive apply again, on a router
+#  that has just demonstrated it doesn't come back cleanly. Automating that
+#  turns one broken router into two.
+#
+#  What the pipeline does instead is stop. The remaining routers are untouched,
+#  the fleet is still serving on them, and the failing job's output names the
+#  check that failed and where to look. Recovery is a human with the provider
+#  console open: see ansible/README.md.
+# =====================================================================
+
+stages: [lint, build, rollout]
+
+variables:
+  # Both build and deploy render from this, so it's named once.
+  PIN: out/pin.json
+
+  # A STOCK PUBLIC IMAGE, built on by each job rather than a custom one pulled
+  # from a registry. This started out as a custom image built by a dind job and
+  # pushed to $CI_REGISTRY_IMAGE, and that assumed two things this setup does
+  # not have:
+  #
+  #   1. A CONTAINER REGISTRY. $CI_REGISTRY is only set when the GitLab
+  #      instance has the registry feature enabled. Unset, `docker login
+  #      "$CI_REGISTRY"` silently falls back to Docker Hub. Which is why the
+  #      failure read `registry-1.docker.io: unauthorized` rather than anything
+  #      about GitLab: and $CI_REGISTRY_IMAGE expands to nothing, making the
+  #      image name a bare `/netdevops:main`.
+  #   2. A PRIVILEGED RUNNER. docker-in-docker needs one; without it the dind
+  #      service never comes up (`mount: permission denied (are you root?)`)
+  #      and every job that needs Docker times out waiting for it.
+  #
+  # Neither is worth requiring. The whole toolchain is python, ansible-core and
+  # an SSH client (no external Ansible collections, since the assertions live
+  # in pytest) so installing it per job costs seconds and removes both
+  # dependencies. ci/Dockerfile is still there if you later want to pre-bake it.
+  IMAGE: python:3.12-slim-bookworm
+
+  # pip cache lives in the project dir so GitLab's cache: can carry it between
+  # jobs and runs.
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pipcache"
+
+default:
+  interruptible: false        # never cancel a job that may be mid-reset
+
+# ---------------------------------------------------------------------
+#  Tooling, installed per job.
+# ---------------------------------------------------------------------
+#  .python  renders and tests. Pure pip. No apt, so it's quick.
+#  .tooling adds the one thing pip can't: an SSH client, plus ping.
+#
+#  Split because the lint stage runs on every push including from a fork, and
+#  there's no reason for it to wait on apt to install an SSH client it will
+#  never use. The split is apt-vs-no-apt; it's NOT a smaller pip set.
+#
+#  .python installs requirements-dev.txt, ansible-core included, even though
+#  nothing in the lint stage talks to a router. The unit suite renders
+#  ansible/chaos.yml through REAL ansible-playbook, because Ansible and plain
+#  Jinja2 disagree about backslashes in Jinja string literals and the Jinja2
+#  answer is the wrong one. See tests/unit/test_chaos_quoting.py. Installing
+#  the lighter set here cost a green unit job on a command the router rejects.
+.python:
+  image: $IMAGE
+  cache:
+    key: "pip-$CI_COMMIT_REF_SLUG"
+    paths: [.pipcache]
+  before_script:
+    - python -m pip install --quiet --upgrade pip
+    - pip install --quiet -r requirements-dev.txt
+
+.tooling:
+  extends: .python
+  before_script:
+    - python -m pip install --quiet --upgrade pip
+    - pip install --quiet -r requirements-dev.txt
+    # openssh-client: every router interaction is ssh/scp.
+    # iputils-ping:   the end-to-end ICMP checks run from this container.
+    # Nothing else is needed: the probes use RouterOS's own /ping over SSH,
+    # and the HTTP checks use urllib rather than curl.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client iputils-ping
+
+# ---------------------------------------------------------------------
+#  LINT: topology validation. No secrets, no network, no hardware.
+# ---------------------------------------------------------------------
+#  Runs on every push and every merge request, including from a fork: it needs
+#  neither the keystore nor a route to the routers. `--keys` points at a
+#  throwaway path so the validator can derive a full fleet from nothing, and
+#  `--out` keeps the render out of the way.
+validate:
+  extends: .python
+  stage: lint
+  needs: []
+  script:
+    - python3 generate.py --check --json --keys /tmp/ephemeral-keys.json | tee validation.json
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths: [validation.json]
+
+# ---------------------------------------------------------------------
+#  UNIT: the generator, tested without touching a router.
+# ---------------------------------------------------------------------
+#  Cheap, hermetic, and it gates every merge. What it covers:
+#
+#    validation   the refusals the README promises, asserted by breaking the
+#                 REAL topology one field at a time
+#    determinism  two renders are byte-identical, and existing keys are never
+#                 regenerated: the property change detection depends on
+#    crossref     for every tunnel, the public key one end configures is
+#                 derived from the private key the other end holds. That's the
+#                 cross-reference graph this repo exists to get right, and it
+#                 fails silently on the wire: the tunnel comes up and never
+#                 handshakes
+#    render       the rendered .rsc won't brick a router. Management access
+#                 is configured before anything that can fail, no unrendered
+#                 Jinja, no multipath=yes, customer whitelists end in a reject
+#    secrets      the CI artifacts contain nothing from the keystore
+#    manifest     the inventory and the pipeline agree with the topology
+#
+#  No keystore here either: the tests render with a throwaway one and replay a
+#  synthetic pin, so this whole stage is safe on an unprotected branch.
+unit:
+  extends: .python
+  stage: lint
+  needs: []
+  script:
+    # tests/unit EXPLICITLY, not tests/. The functional suite needs
+    # out/manifest.json and live routers; collecting it here makes the lint
+    # stage fail on the absence of a fleet it was never supposed to touch.
+    # pytest.ini's `testpaths` says the same thing, but a path argument on the
+    # command line overrides it: so the argument has to agree.
+    - python3 -m pytest tests/unit -v --junitxml=report.xml
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit: report.xml
+
+# ---------------------------------------------------------------------
+#  BUILD: render for real, and freeze the inputs.
+# ---------------------------------------------------------------------
+#  The first job that needs the keystore, and the last one that talks to the
+#  two URLs generate.py fetches from (the management SSH keys and the
+#  mgmt_prefixes endpoint). --pin writes what they returned so every later job
+#  renders from the same answers.
+#
+#  Note what does NOT leave this job: out/*.rsc. They hold WireGuard private
+#  keys, and publishing them as artifacts would put them in GitLab's artifact
+#  store for the expiry window. The deploy jobs re-render instead. Which is
+#  identical, because the generator is deterministic and the fetches are pinned,
+#  and both of those are asserted in `unit`.
+build:
+  extends: .python
+  stage: build
+  needs: [validate, unit]
+  rules:
+    # Protected refs only: this is the first job handed KEYS_JSON.
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+  script:
+    # Preflight, because `install: can't stat ''` is what an unset
+    # File-type variable looks like otherwise. An error about a missing
+    # file, naming no variable, in a job whose rule already proved the ref is
+    # protected. Name what is missing and how to set it.
+    - |
+      for v in KEYS_JSON; do
+        eval "path=\$$v"
+        test -n "$path" || { echo "$v is empty. Set it in Settings -> CI/CD -> Variables as Type=File and Protected (NOT masked -- GitLab rejects multi-line values). It is empty even though this ref IS protected, so it is not defined at all (or is defined under another name)."; exit 1; }
+        test -f "$path" || { echo "$v is set to '$path' but no such file exists. A File-type variable holds a PATH; a plain Variable holds the CONTENT. This one looks like the wrong type."; exit 1; }
+      done
+    - install -m 600 "$KEYS_JSON" keys.json
+    - python3 generate.py --pin "$PIN"
+    - |
+      # A rendered .rsc must never reach the artifact store. Belt and braces on
+      # top of the artifact paths below, because getting this wrong is silent.
+      rm -f out/*.rsc out/snmp_zabbix.env
+  after_script:
+    # after_script, NOT the end of script:. `script` stops at the first failing
+    # step, so a shred there only runs when nothing went wrong. Which is the
+    # one case where leaving a keystore on a long-lived on-prem runner doesn't
+    # matter. after_script runs either way.
+    - shred -u keys.json 2>/dev/null || rm -f keys.json
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - out/manifest.json     # what the functional tests assert against
+      - out/inventory.yml     # the fleet, for Ansible
+      - out/pipeline.yml      # the rollout, generated from the topology
+      - out/pin.json          # the frozen fetches
+      - out/dns_records.csv
+      - out/*.conf            # customer configs: no keys, meant to be handed over
+
+# ---------------------------------------------------------------------
+#  ROLLOUT: the generated child pipeline.
+# ---------------------------------------------------------------------
+#  Automatic on the default branch: merging is the deploy. That's a real
+#  decision and worth being clear-eyed about. It means a bad render reaches a
+#  live border router with nobody watching. What stands between those two
+#  things is the `lint` stage refusing to build it, the `baseline` job refusing
+#  to start on an unhealthy fleet, and the per-router verify jobs stopping the
+#  roll at the first router that doesn't come back correctly.
+#
+#  strategy: depend makes THIS job's status the child's status, so the parent
+#  pipeline is red when the rollout is red rather than green with a failure
+#  buried one level down.
+rollout:
+  stage: rollout
+  needs: [build]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  variables:
+    # The child needs this to reach back for the build job's artifacts.
+    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+  trigger:
+    include:
+      - artifact: out/pipeline.yml
+        job: build
+    strategy: depend
+
+# ---------------------------------------------------------------------
+#  What a merge request gets instead.
+# ---------------------------------------------------------------------
+#  A build with no deploy: render against the real keystore, then say which
+#  routers WOULD be reset if this merged. `deploy.yml` decides that by
+#  comparing a fresh render's sha256 against a fingerprint stashed on each
+#  device, and --check runs exactly that comparison and stops.
+#
+#  This is the review artifact. "Changes the OSPF cost on wan2" and "resets all
+#  four routers" are very different merge requests, and the diff alone doesn't
+#  tell them apart.
+plan:
+  extends: .tooling
+  stage: rollout
+  needs: [build]
+  rules:
+    # Both clauses do real work.
+    #
+    # `never` on an unprotected ref because this job needs KEYS_JSON, and a
+    # protected variable is simply not present there. So on a merge request
+    # from an ordinary feature branch (or a fork) this is SKIPPED, not failed.
+    # That also keeps `needs: [build]` from dangling: `build` carries the same
+    # protected-ref condition, so whenever this job exists, that one does too.
+    #
+    # Put plainly: an MR from an unprotected
+    # branch gets `validate` and `unit` and no plan. Those two need no secrets
+    # and no route to the routers, which is what makes them safe to run on a
+    # fork: and they are also where the great majority of mistakes are
+    # caught. To get a plan on merge requests, protect the branch pattern you
+    # develop on; do NOT unprotect KEYS_JSON.
+    - if: $CI_COMMIT_REF_PROTECTED != "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    ANSIBLE_CONFIG: ansible/ansible.cfg
+  script:
+    # Preflight, because `install: can't stat ''` is what an unset
+    # File-type variable looks like otherwise. An error about a missing
+    # file, naming no variable, in a job whose rule already proved the ref is
+    # protected. Name what is missing and how to set it.
+    - |
+      for v in KEYS_JSON SSH_PRIVATE_KEY; do
+        eval "path=\$$v"
+        test -n "$path" || { echo "$v is empty. Set it in Settings -> CI/CD -> Variables as Type=File and Protected (NOT masked -- GitLab rejects multi-line values). It is empty even though this ref IS protected, so it is not defined at all (or is defined under another name)."; exit 1; }
+        test -f "$path" || { echo "$v is set to '$path' but no such file exists. A File-type variable holds a PATH; a plain Variable holds the CONTENT. This one looks like the wrong type."; exit 1; }
+      done
+    - install -m 600 "$KEYS_JSON" keys.json
+    - mkdir -p ~/.ssh && install -m 600 "$SSH_PRIVATE_KEY" ~/.ssh/id_ed25519
+    - python3 generate.py --use-pin "$PIN"
+    # SSH_PRIVATE_KEY is the AUTOMATION key, so this has to log in as the
+    # automation user: group_vars defaults router_user to the human account,
+    # which is right at a keyboard and wrong here. Read from the manifest so
+    # the name lives in topology.yml only.
+    - ROUTER_USER=$(python3 -c "import json;a=json.load(open('out/manifest.json')).get('automation');print((a or {}).get('user') or '')")
+    - test -n "$ROUTER_USER" || { echo "topology.yml declares no automation block"; exit 1; }
+    # --check makes deploy.yml walk the plan and change nothing: it still
+    # fetches each device's fingerprint and reports CHANGED or UNCHANGED.
+    - ansible-playbook ansible/deploy.yml --check -e gate=auto -e router_user="$ROUTER_USER" | tee plan.txt
+  after_script:
+    - shred -u keys.json 2>/dev/null || rm -f keys.json
+    - rm -f ~/.ssh/id_ed25519
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+    paths: [plan.txt]

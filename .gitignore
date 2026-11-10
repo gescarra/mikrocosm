@@ -1,0 +1,19 @@
+# SECRETS. Never commit.
+keys.json
+keys.json.bak
+out/
+.env
+
+# aws/ holds the BYOIP/BYOASN private key AND the onboarding script.
+# Deny by default: a new key file dropped in here is ignored without anyone
+# having to remember to add it. Code is allow-listed back in, explicitly.
+aws/*
+!aws/*.py
+!aws/README.md
+
+# Local tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
